@@ -190,7 +190,7 @@ def patch(
 			with open(all_cost_file, 'wb') as f:
 				import pickle
 				pickle.dump(indices_w_costs, f)	
-	elif loc_method == 'sbfl':
+	elif loc_method == 'qexec_qres_sbfl':
 		if not only_loc: # reuse the same heuristic as GL for now
 			if which == 'simple_fm':
 				top_n = int(np.round(7.6))
@@ -203,7 +203,7 @@ def patch(
 		else:
 			top_n = -1
 
-		indices_w_costs = run_localise.localise_by_sbfl_participation(
+		indices_w_costs = run_localise.localise_by_qexec_qres_sbfl(
 			X_for_loc, y_for_loc, predictions_for_loc,
 			target_weights,
 			path_to_keras_model = path_to_keras_model,
@@ -219,12 +219,79 @@ def patch(
 		destfile = os.path.join(loc_dest, "loc.{}.{}.pkl".format(patch_target_key, int(target_all)))
 		output_df.to_pickle(destfile)
 		print ("Saved to", destfile)
-		if only_loc:
-			all_cost_file = os.path.join(loc_dest, 
-				"loc.{}.{}.sbfl.all_cost.pkl".format(patch_target_key, int(target_all)))
-			with open(all_cost_file, 'wb') as f:
-				import pickle
-				pickle.dump(indices_w_costs, f)
+		all_cost_file = os.path.join(
+			loc_dest, "loc.{}.{}.qexec_qres_sbfl.all_cost.pkl".format(patch_target_key, int(target_all)))
+		with open(all_cost_file, 'wb') as f:
+			import pickle
+			pickle.dump(indices_w_costs, f)
+	elif loc_method == 'qexec_bres_sbfl':
+		if not only_loc:
+			if which == 'simple_fm':
+				top_n = int(np.round(7.6))
+			elif which == 'simple_cm':
+				top_n = int(np.round(11.6))
+			elif which == 'GTSRB': # GTSRB
+				top_n = int(np.round(14.3))
+			else: # lstm or others
+				top_n = 14
+		else:
+			top_n = -1
+
+		indices_w_costs = run_localise.localise_by_qexec_bres_sbfl(
+			X_for_loc, y_for_loc, predictions_for_loc,
+			target_weights,
+			path_to_keras_model = path_to_keras_model,
+			is_multi_label = is_multi_label)
+
+		indices_to_places_to_fix = [v[0] for v in indices_w_costs[:top_n]]
+		loc_dest = os.path.join(loc_dest, "qexec_bres_sbfl")
+		os.makedirs(loc_dest, exist_ok=True)
+
+		output_df = pd.DataFrame(
+			{'layer':[vs[0] for vs in indices_to_places_to_fix], 
+			'weight':[vs[1] for vs in indices_to_places_to_fix]}) 
+		destfile = os.path.join(loc_dest, "loc.{}.{}.pkl".format(patch_target_key, int(target_all)))
+		output_df.to_pickle(destfile)
+		print ("Saved to", destfile)
+		all_cost_file = os.path.join(
+			loc_dest, "loc.{}.{}.qexec_bres_sbfl.all_cost.pkl".format(patch_target_key, int(target_all)))
+		with open(all_cost_file, 'wb') as f:
+			import pickle
+			pickle.dump(indices_w_costs, f)
+	elif loc_method == 'bexec_qres_guider':
+		if not only_loc:
+			if which == 'simple_fm':
+				top_n = int(np.round(7.6))
+			elif which == 'simple_cm':
+				top_n = int(np.round(11.6))
+			elif which == 'GTSRB': # GTSRB
+				top_n = int(np.round(14.3))
+			else: # lstm or others
+				top_n = 14
+		else:
+			top_n = -1
+
+		indices_w_costs = run_localise.localise_by_bexec_qres_guider(
+			X_for_loc, y_for_loc, predictions_for_loc,
+			target_weights,
+			path_to_keras_model = path_to_keras_model,
+			is_multi_label = is_multi_label)
+
+		indices_to_places_to_fix = [v[0] for v in indices_w_costs[:top_n]]
+		loc_dest = os.path.join(loc_dest, "bexec_qres_guider")
+		os.makedirs(loc_dest, exist_ok=True)
+
+		output_df = pd.DataFrame(
+			{'layer':[vs[0] for vs in indices_to_places_to_fix], 
+			'weight':[vs[1] for vs in indices_to_places_to_fix]}) 
+		destfile = os.path.join(loc_dest, "loc.{}.{}.pkl".format(patch_target_key, int(target_all)))
+		output_df.to_pickle(destfile)
+		print ("Saved to", destfile)
+		all_cost_file = os.path.join(
+			loc_dest, "loc.{}.{}.bexec_qres_guider.all_cost.pkl".format(patch_target_key, int(target_all)))
+		with open(all_cost_file, 'wb') as f:
+			import pickle
+			pickle.dump(indices_w_costs, f)
 	elif loc_method == 'localiser':
 		if loc_file is None or not (os.path.exists(loc_file)):
 			indices_to_places_to_fix, front_lst = run_localise.localise_by_chgd_unchgd(
@@ -346,4 +413,3 @@ def patch(
 
 	
 			
-

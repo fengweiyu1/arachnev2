@@ -112,55 +112,64 @@ def load_data(which, path_to_data,
 		test_data[0] = np.array([np.moveaxis(vs[0],[0],[-1]) for vs in sorted_test_vs])
 		test_data[1] = np.array([vs[1] for vs in sorted_test_vs])
 	elif which in ['fashion_mnist', 'cifar10']:
-		import torch
-		import torchvision
-		import torchvision.transforms as transforms
-
 		if which == 'fashion_mnist':
-			trainset = torchvision.datasets.FashionMNIST(root=path_to_data, train=True,
-				download=True, transform=transforms.ToTensor())
-			testset = torchvision.datasets.FashionMNIST(root=path_to_data, train=False,
-				download=True, transform=transforms.ToTensor())
+			# Keras has FashionMNIST cached locally; prefer local load
+			from tensorflow.keras.datasets import fashion_mnist
+			(train_X, train_y), (test_X, test_y) = fashion_mnist.load_data(path=path_to_data if isinstance(path_to_data, str) else None)
+			train_X = np.expand_dims(train_X, -1)
+			test_X = np.expand_dims(test_X, -1)
+			train_data = [train_X.astype(np.float32) / 255.0, train_y.astype(np.int64)]
+			test_data = [test_X.astype(np.float32) / 255.0, test_y.astype(np.int64)]
+		else:  # cifar10
+			# Prefer local CIFAR10 batches under path_to_data; fall back to keras download if not found
+			import os, pickle
+			def load_cifar_batches(root):
+				batch_dir = None
+				candidate_dirs = [
+					os.path.join(root, "cifar-10-batches-py"),
+					os.path.join(root, "train", "cifar-10-batches-py"),
+					os.path.join(root, "test", "cifar-10-batches-py"),
+				]
+				for d in candidate_dirs:
+					if os.path.isdir(d) and os.path.isfile(os.path.join(d, "data_batch_1")):
+						batch_dir = d
+						break
+				if batch_dir is None:
+					return None
+
+				def load_batch(fname):
+					with open(os.path.join(batch_dir, fname), 'rb') as f:
+						d = pickle.load(f, encoding='bytes')
+						data = d[b'data']
+						labels = d[b'labels']
+						return data, labels
+
+				train_X_list = []
+				train_y_list = []
+				for i in range(1,6):
+					dat, lbl = load_batch(f"data_batch_{i}")
+					train_X_list.append(dat)
+					train_y_list.extend(lbl)
+				# channels_last for converted model
+				train_X = np.vstack(train_X_list).reshape(-1, 3, 32, 32).transpose(0,2,3,1)
+				train_y = np.array(train_y_list, dtype=np.int64)
+				test_dat, test_lbl = load_batch("test_batch")
+				test_X = test_dat.reshape(-1,3,32,32).transpose(0,2,3,1)
+				test_y = np.array(test_lbl, dtype=np.int64)
+				return (train_X, train_y), (test_X, test_y)
+
+		local = load_cifar_batches(path_to_data)
+		if local is None:
+			from tensorflow.keras.datasets import cifar10
+			(train_X, train_y), (test_X, test_y) = cifar10.load_data()
+			train_y = train_y.flatten()
+			test_y = test_y.flatten()
+			# already channels_last
 		else:
-			trainset = torchvision.datasets.CIFAR10(root=os.path.join(path_to_data, "train"), train=True,
-				download=True, transform=transforms.ToTensor())
-			testset = torchvision.datasets.CIFAR10(root=os.path.join(path_to_data, "test"), train=False,
-				download=True, transform=transforms.ToTensor())
+			(train_X, train_y), (test_X, test_y) = local
 
-		trainloader = torch.utils.data.DataLoader(trainset, batch_size=1, shuffle=False)
-		testloader = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=False)
-
-		train_data = [[],[]]
-		
-		for data in trainloader:
-			images, labels = data
-			if which == 'fashion_mnist': # and bool(is_input_2d):
-				if is_input_2d: # for RQ1s
-					#train_data[0].append(images.numpy()[0].reshape(-1,))
-					train_data[0].append(images.numpy()[0]) # for rq5
-				else:
-					train_data[0].append(images.numpy()[0].reshape(1,-1))
-			else:
-				train_data[0].append(images.numpy()[0])
-			train_data[1].append(labels.item())
-
-		train_data[0] = np.asarray(train_data[0])
-		train_data[1] = np.asarray(train_data[1])
-
-		test_data = [[],[]]
-		for data in testloader:
-			images, labels = data
-			if which == 'fashion_mnist': # and is_input_2d is not None: 
-				if is_input_2d: # for RQ1
-					test_data[0].append(images.numpy()[0]) # for rq5
-				else:
-					test_data[0].append(images.numpy()[0].reshape(1,-1))
-			else:
-				test_data[0].append(images.numpy()[0])
-			test_data[1].append(labels.item())
-
-		test_data[0] = np.asarray(test_data[0])
-		test_data[1] = np.asarray(test_data[1])
+		train_data = [train_X.astype(np.float32) / 255.0, train_y.astype(np.int64)]
+		test_data = [test_X.astype(np.float32) / 255.0, test_y.astype(np.int64)]
 	elif which in ['GTSRB', 'us_airline']:
 		import pickle
 		# train
@@ -174,6 +183,12 @@ def load_data(which, path_to_data,
 			test_data = pickle.load(f)
 		if isinstance(test_data, dict):
 			test_data = [test_data['data'], test_data['label']]
+		# ensure channels_last for GTSRB
+		if which == 'GTSRB':
+			if len(train_data[0].shape) == 4 and train_data[0].shape[1] == 3:
+				train_data[0] = np.moveaxis(train_data[0], 1, -1)
+			if len(test_data[0].shape) == 4 and test_data[0].shape[1] == 3:
+				test_data[0] = np.moveaxis(test_data[0], 1, -1)
 	else: # for simple_lstm or airline_passengers
 		import pickle
 		with open(path_to_data, 'rb') as f:
@@ -367,6 +382,3 @@ def get_dataset_for_rq5(pred_file, top_n):
 		(df.true == top_n_misclf[0]) & (df.pred == top_n_misclf[1])].index.values
 	indices_to_corrclf = df.loc[df.true == df.pred].index.values
 	return top_n_misclf, indices_to_misclf, indices_to_corrclf
-
-
-

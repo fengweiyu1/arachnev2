@@ -11,6 +11,8 @@ import numpy as np
 LAYER = -1 # all layers
 # Use the in-repo faulty models layout (data is symlinked to final_data)
 Faulty_mdl_path = "data/models/rq1_faulty_mdl"
+Faulty_mdl_path_cifar_cl = "data/models/rq1_faulty_mdl_cifar_cl"
+Faulty_mdl_path_gtsrb_cl = "data/models/rq1_faulty_mdl_gtsrb_cl"
 
 def return_target_fault_id(afile, seed):
 	if afile is None:
@@ -78,7 +80,7 @@ if __name__ == "__main__":
 	parser.add_argument('-which_data', action = "store", default = 'cifar10', type = str, 
 		help = 'fashion_mnist,cifaf10,lfw')
 	parser.add_argument("-loc_method", action = "store", default = None, 
-	help = 'random, localiser, gradient_loss, c_localiser, sbfl')
+	help = 'random, localiser, gradient_loss, c_localiser, qexec_qres_sbfl, qexec_bres_sbfl, bexec_qres_guider')
 	parser.add_argument("-seed", action = "store", default = 1, type = int)
 	parser.add_argument("-dest", default = ".", type = str)
 	parser.add_argument("-target_all", type = int, default = 1)
@@ -94,6 +96,24 @@ if __name__ == "__main__":
 	if path_to_faulty_model is None:
 		print ('Seed {} not our target for layer {}'.format(args.seed, LAYER))
 		sys.exit()
+
+	# For CIFAR10 channels_first models, convert to channels_last for CPU execution
+	if args.which_data == 'cifar10':
+		cl_path = path_to_faulty_model.replace(Faulty_mdl_path, Faulty_mdl_path_cifar_cl)
+		if not os.path.exists(cl_path):
+			from utils import model_util
+			os.makedirs(os.path.dirname(cl_path), exist_ok=True)
+			model_util.convert_cifar_to_channels_last(path_to_faulty_model, cl_path)
+		path_to_faulty_model = cl_path
+	# For GTSRB channels_first models, convert to channels_last for CPU execution
+	if args.which_data == 'GTSRB':
+		cl_path = path_to_faulty_model.replace(Faulty_mdl_path, Faulty_mdl_path_gtsrb_cl)
+		if not os.path.exists(cl_path):
+			from utils import model_util
+			os.makedirs(os.path.dirname(cl_path), exist_ok=True)
+			model_util.convert_gtsrb_to_channels_last(path_to_faulty_model, cl_path)
+		path_to_faulty_model = cl_path
+
 	os.makedirs(args.dest, exist_ok = True)
 
 	# is_input_2d = True => to match the format with faulty model
