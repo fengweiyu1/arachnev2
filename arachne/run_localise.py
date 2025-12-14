@@ -1519,12 +1519,14 @@ def localise_by_qexec_bres_sbfl(
     X, y, predictions, target_weights,
     path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1):
     """
-    Quantised execution (FI-based) + binary result (pass/fail=1).
+    Quantised execution (FI-based) + binary result (pass/fail=1), weighted by prediction confidence.
     """
     if predictions.ndim == 1:
         pred_labels = np.round(predictions).astype(int)
+        pred_confidence = predictions.flatten()
     else:
         pred_labels = np.argmax(predictions, axis=1)
+        pred_confidence = predictions[np.arange(len(pred_labels)), pred_labels]
     if y.ndim > 1:
         true_labels = np.argmax(y, axis=1)
     else:
@@ -1537,20 +1539,23 @@ def localise_by_qexec_bres_sbfl(
         rng = np.random.default_rng()
         idx_pass = rng.choice(idx_pass, sample_size, replace=False)
         idx_fail = rng.choice(idx_fail, sample_size, replace=False)
+    # align weights with possibly downsampled indices
+    pass_scores = pred_confidence[idx_pass] if len(idx_pass) else np.array([])
+    fail_scores = pred_confidence[idx_fail] if len(idx_fail) else np.array([])
 
     fail_cands = compute_FI_and_GL(
         X, y, idx_fail, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
-        sample_weights=None,
+        sample_weights=fail_scores if len(fail_scores) else None,
         use_gradient_loss=False)
     pass_cands = compute_FI_and_GL(
         X, y, idx_pass, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
-        sample_weights=None,
+        sample_weights=pass_scores if len(pass_scores) else None,
         use_gradient_loss=False)
 
     costs_and_keys = []
