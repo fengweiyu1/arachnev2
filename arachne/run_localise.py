@@ -1129,7 +1129,8 @@ def localise_by_qexec_qres_sbfl(
     Localise using forward feedback (FI) as participation and SBFL-style success/failure scores.
 
     Success score: predicted probability of the (correct) class when prediction is correct.
-    Failure score: 1 - probability of the wrongly predicted class when prediction is incorrect.
+    Failure score: predicted probability of the wrongly predicted class when prediction is incorrect
+    (so confident-but-wrong samples contribute more).
     Suspiciousness per weight: fail_participation / (fail_participation + pass_participation).
     """
     if predictions.ndim == 1:
@@ -1146,7 +1147,8 @@ def localise_by_qexec_qres_sbfl(
 
     correct_mask = pred_labels == true_labels
     success_scores = np.where(correct_mask, pred_confidence, 0.0)
-    failure_scores = np.where(~correct_mask, 1.0 - pred_confidence, 0.0)
+    # Penalise confident-but-wrong predictions more heavily (use conf itself as failure weight).
+    failure_scores = np.where(~correct_mask, pred_confidence, 0.0)
 
     indices_to_pass = np.where(success_scores > 0)[0]
     indices_to_fail = np.where(failure_scores > 0)[0]
