@@ -179,6 +179,32 @@ def _weighted_mean(arr, weights):
     return np.tensordot(weights, arr, axes=([0], [0]))
 
 
+def _weighted_agg(arr, weights, mode="mean"):
+    """
+    Weighted aggregation over axis 0.
+
+    mode="mean": sum(w * arr) / sum(w)
+    mode="sum" : sum(w * arr)   (keeps magnitude; better to reflect qres strength)
+    """
+    if weights is None:
+        return np.mean(arr, axis=0) if mode == "mean" else np.sum(arr, axis=0)
+
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    if w.size == 0:
+        return np.mean(arr, axis=0) if mode == "mean" else np.sum(arr, axis=0)
+
+    if mode == "mean":
+        denom = float(np.sum(w))
+        if denom <= 0:
+            return np.mean(arr, axis=0)
+        w = w / denom
+        return np.tensordot(w, arr, axes=([0], [0]))
+    elif mode == "sum":
+        return np.tensordot(w, arr, axes=([0], [0]))
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+
 def compute_gradient_to_output(path_to_keras_model, 
     idx_to_target_layer, X,
     by_batch = False, on_weight = False, wo_reset = False,federated=False,
@@ -219,7 +245,13 @@ def compute_gradient_to_output(path_to_keras_model,
     else:
         chunks = [np.arange(num)]
 
-    weights = _normalise_sample_weights(num, sample_weights)
+    weights = None
+    if sample_weights is not None:
+        weights = np.asarray(sample_weights, dtype=float).flatten()
+        assert len(weights) == num, f"Weight length {len(weights)} does not match number of samples {num}"
+        weights = np.clip(weights, a_min=0.0, a_max=None)
+        if np.sum(weights) == 0:
+            weights = None
 
     if not on_weight:
         grad_shape = tuple([num] + [int(v) for v in tensor_grad[0].shape[1:]])
@@ -237,7 +269,8 @@ def compute_gradient_to_output(path_to_keras_model,
         norm_gradient = norm_scaler.fit_transform(reshaped_gradient) # normalised
 
 
-        mean_gradient = _weighted_mean(norm_gradient, weights) # compute mean for a given input
+        # Keep magnitude so that higher qres (weights) produces larger aggregated signal.
+        mean_gradient = _weighted_agg(norm_gradient, weights, mode="sum")
 
         ret_gradient = mean_gradient.reshape(gradient.shape[1:]) # reshape to the orignal shape
         #print("after mean and reshape", ret_gradient.shape)
@@ -475,10 +508,13 @@ def compute_FI_and_GL(
     target_y = y[indices_to_target]
     weights = None
     if sample_weights is not None:
-        weights = np.asarray(sample_weights, dtype = float).flatten()
+        weights = np.asarray(sample_weights, dtype=float).flatten()
         if len(weights) != len(target_X):
             weights = weights[indices_to_target]
-        weights = _normalise_sample_weights(len(target_X), weights)
+        # Keep magnitude for sum aggregation (qexec × qres); only clip negatives and drop all-zero.
+        weights = np.clip(weights, a_min=0.0, a_max=None)
+        if np.sum(weights) == 0:
+            weights = None
 
     # get loss func
     loss_func = model_util.get_loss_func(is_multi_label = is_multi_label)
@@ -517,7 +553,8 @@ def compute_FI_and_GL(
                 output = np.abs(output)
                 output = norm_scaler.fit_transform(output)
                 #print("BEfore mean",output.shape)
-                output = _weighted_mean(output, weights)
+                # exec × qres aggregation: sum_i (w_i * exec_i)
+                output = _weighted_agg(output, weights, mode="sum")
                 #print(output.shape)
                 from_front.append(output)
 
@@ -660,7 +697,8 @@ def compute_FI_and_GL(
                         #avg_output = np.mean(output,axis=0)
                         #output = output#/sum_output
                         output = np.nan_to_num(output, posinf = 0.)
-                        output = _weighted_mean(output, weights)
+                        # exec × qres aggregation: sum_i (w_i * exec_i)
+                        output = _weighted_agg(output, weights, mode="sum")
                         from_front.append(output)
 
             from_front = np.asarray(from_front)
@@ -1118,113 +1156,6 @@ def localise_by_chgd_unchgd(
     return pareto_front, costs_and_keys
 
 
-def localise_by_qexec_qres_sbfl(
-    X, y,
-    predictions,
-    target_weights,
-    path_to_keras_model = None,
-    is_multi_label = True,
-    eps = 1e-12):
-    """
-    Localise using forward feedback (FI) as participation and SBFL-style success/failure scores.
-
-    Success score: predicted probability of the (correct) class when prediction is correct.
-    Failure score: predicted probability of the wrongly predicted class when prediction is incorrect
-    (so confident-but-wrong samples contribute more).
-    Suspiciousness per weight: fail_participation / (fail_participation + pass_participation).
-    """
-    if predictions.ndim == 1:
-        pred_labels = np.round(predictions).astype(int)
-        pred_confidence = predictions.flatten()
-    else:
-        pred_labels = np.argmax(predictions, axis = 1)
-        pred_confidence = predictions[np.arange(len(pred_labels)), pred_labels]
-
-    if y.ndim > 1:
-        true_labels = np.argmax(y, axis = 1)
-    else:
-        true_labels = y
-
-    correct_mask = pred_labels == true_labels
-    success_scores = np.where(correct_mask, pred_confidence, 0.0)
-    # Penalise confident-but-wrong predictions more heavily (use conf itself as failure weight).
-    failure_scores = np.where(~correct_mask, pred_confidence, 0.0)
-
-    indices_to_pass = np.where(success_scores > 0)[0]
-    indices_to_fail = np.where(failure_scores > 0)[0]
-
-    fail_cands = compute_FI_and_GL(
-        X, y, indices_to_fail, target_weights,
-        is_multi_label = is_multi_label,
-        path_to_keras_model = path_to_keras_model,
-        federated = False,
-        sample_weights = failure_scores,
-        use_gradient_loss = False)
-    pass_cands = compute_FI_and_GL(
-        X, y, indices_to_pass, target_weights,
-        is_multi_label = is_multi_label,
-        path_to_keras_model = path_to_keras_model,
-        federated = False,
-        sample_weights = success_scores,
-        use_gradient_loss = False)
-
-    indices_to_nodes = []
-    costs_and_keys = []
-
-    for idx_to_tl, vs in target_weights.items():
-        t_w, lname = vs
-        fail_entry = fail_cands.get(idx_to_tl, {'costs':[], 'shape':[]}) if isinstance(fail_cands, dict) else {}
-        pass_entry = pass_cands.get(idx_to_tl, {'costs':[], 'shape':[]}) if isinstance(pass_cands, dict) else {}
-
-        if not model_util.is_LSTM(lname):
-            target_shape = fail_entry.get('shape') or pass_entry.get('shape') or t_w.shape
-            fail_costs = fail_entry.get('costs', None)
-            pass_costs = pass_entry.get('costs', None)
-
-            if fail_costs is None or len(np.asarray(fail_costs)) == 0:
-                fail_vals = np.zeros(np.prod(target_shape))
-            else:
-                fail_vals = np.asarray(fail_costs).reshape(-1)
-            if pass_costs is None or len(np.asarray(pass_costs)) == 0:
-                pass_vals = np.zeros(np.prod(target_shape))
-            else:
-                pass_vals = np.asarray(pass_costs).reshape(-1)
-
-            if fail_vals.shape != pass_vals.shape:
-                if fail_vals.shape[0] == 0:
-                    fail_vals = np.zeros_like(pass_vals)
-                elif pass_vals.shape[0] == 0:
-                    pass_vals = np.zeros_like(fail_vals)
-
-            suspiciousness = fail_vals/(fail_vals + pass_vals + eps)
-            for i, sus in enumerate(suspiciousness):
-                costs_and_keys.append(([idx_to_tl, i], sus))
-                indices_to_nodes.append([idx_to_tl, np.unravel_index(i, target_shape)])
-        else:
-            target_shapes = fail_entry.get('shape') or pass_entry.get('shape') or [w.shape for w in t_w]
-            fail_costs_list = fail_entry.get('costs', [])
-            pass_costs_list = pass_entry.get('costs', [])
-
-            for idx_to_w, shape in enumerate(target_shapes):
-                _fail_costs = fail_costs_list[idx_to_w] if idx_to_w < len(fail_costs_list) else []
-                _pass_costs = pass_costs_list[idx_to_w] if idx_to_w < len(pass_costs_list) else []
-                fail_vals = np.asarray(_fail_costs).reshape(-1)
-                pass_vals = np.asarray(_pass_costs).reshape(-1)
-                if fail_vals.shape[0] == 0:
-                    fail_vals = np.zeros(np.prod(shape))
-                if pass_vals.shape[0] == 0:
-                    pass_vals = np.zeros(np.prod(shape))
-
-                suspiciousness = fail_vals/(fail_vals + pass_vals + eps)
-                for local_i, sus in enumerate(suspiciousness):
-                    costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
-                    indices_to_nodes.append(
-                        [(idx_to_tl, idx_to_w), np.unravel_index(local_i, shape)])
-
-    sorted_costs_and_keys = sorted(costs_and_keys, key = lambda vs:vs[1], reverse = True)
-    return sorted_costs_and_keys
-
-
 def localise_by_gradient(
     X, y,
     indices_to_chgd,
@@ -1347,29 +1278,39 @@ def _get_layer_output(model, layer_idx, X):
 
 def _coverage_per_unit(model, layer_idx, X, sample_weights, activation_threshold=0.1):
     """
-    Return coverage per output unit/channel for a given layer, weighted by sample_weights.
-    For Dense: shape (out_units,)
-    For Conv2D: shape (out_channels,)
+    Return weighted coverage counts per output unit/channel (EF/EP numerator).
+    For Dense: shape (out_units,) based on per-sample activation >= threshold.
+    For Conv2D: shape (out_channels,) using per-sample max over spatial dims.
     """
+    if X is None or len(X) == 0:
+        return None
+
     out = _get_layer_output(model, layer_idx, X)
     act = np.abs(out)
-    # reduce spatial dims for conv
     lname = type(model.layers[layer_idx]).__name__
     if model_util.is_FC(lname):
-        act_unit = np.max(act, axis=0)  # (out_units,)
+        if act.ndim > 2:
+            act = act.reshape(act.shape[0], -1)
+        covered = (act >= activation_threshold).astype(float)  # (N, out_units)
     elif model_util.is_C2D(lname):
-        # assume channels_last
-        act_unit = np.max(act, axis=(0, 1, 2))  # (out_channels,)
+        # assume channels_last; reduce spatial dims per-sample
+        if act.ndim != 4:
+            return None
+        act_unit = np.max(act, axis=(1, 2))  # (N, out_channels)
+        covered = (act_unit >= activation_threshold).astype(float)
     else:
         return None
-    max_abs = np.max(act_unit) if act_unit.size else 0.0
-    if max_abs > 0:
-        act_unit = act_unit / max_abs
-    cov_unit = (act_unit >= activation_threshold).astype(float)
-    # weight by sample_weights (scalar per sample); here act_unit already aggregated over samples,
-    # so just scale coverage by mean weight
-    weight_scalar = float(np.mean(sample_weights)) if sample_weights is not None and len(sample_weights) else 1.0
-    return cov_unit * weight_scalar
+
+    weights = None
+    if sample_weights is not None:
+        weights = np.clip(np.asarray(sample_weights, dtype=float).reshape(-1), 0.0, None)
+        if weights.shape[0] != covered.shape[0]:
+            return None
+    else:
+        weights = np.ones(covered.shape[0], dtype=float)
+
+    # weighted coverage per unit: sum_i w_i * covered_i,u
+    return np.tensordot(weights, covered, axes=([0], [0]))
 
 
 def _suspicious_from_cov(fail_cov, pass_cov, target_shape, eps=1e-12):
@@ -1381,27 +1322,41 @@ def _suspicious_from_cov(fail_cov, pass_cov, target_shape, eps=1e-12):
 
 
 def _build_results_from_cov(layer_idx, lname, t_w, fail_cov, pass_cov, eps=1e-12):
+    """
+    Map unit-level fail/pass coverage (EF/EP) to weight-level suspiciousness using Tarantula.
+    fail_cov/pass_cov: shape (out_units or out_channels,)
+    """
     costs_and_keys = []
-    indices_to_nodes = []
+    fail_cov = np.clip(np.asarray(fail_cov, dtype=float).reshape(-1), 0.0, None)
+    pass_cov = np.clip(np.asarray(pass_cov, dtype=float).reshape(-1), 0.0, None)
+    ef_tot = float(np.sum(fail_cov)) + eps
+    ep_tot = float(np.sum(pass_cov)) + eps
+    fail_rate = fail_cov / ef_tot
+    pass_rate = pass_cov / ep_tot
+    sus_per_unit = fail_rate / (fail_rate + pass_rate + eps)
+
     if model_util.is_FC(lname):
         out_dim = t_w.shape[-1]
         in_dim = t_w.shape[0]
-        fail_vals = np.repeat(fail_cov, in_dim).reshape(out_dim, in_dim).T.flatten()
-        pass_vals = np.repeat(pass_cov, in_dim).reshape(out_dim, in_dim).T.flatten()
+        if len(sus_per_unit) != out_dim:
+            sus_per_unit = np.resize(sus_per_unit, out_dim)
+        # replicate unit score across its incoming weights (column)
+        scores = np.repeat(sus_per_unit, in_dim).reshape(out_dim, in_dim).T.flatten()
         target_shape = t_w.shape
+        for i, sus in enumerate(scores):
+            costs_and_keys.append(([layer_idx, i], sus))
     elif model_util.is_C2D(lname):
         out_dim = t_w.shape[-1]
         repeat_size = int(np.prod(t_w.shape[:-1]))
-        fail_vals = np.repeat(fail_cov, repeat_size)
-        pass_vals = np.repeat(pass_cov, repeat_size)
+        if len(sus_per_unit) != out_dim:
+            sus_per_unit = np.resize(sus_per_unit, out_dim)
+        scores = np.repeat(sus_per_unit, repeat_size)
         target_shape = t_w.shape
+        for i, sus in enumerate(scores):
+            costs_and_keys.append(([layer_idx, i], sus))
     else:
         return costs_and_keys
-    total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
-    suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
-    for i, sus in enumerate(suspiciousness):
-        costs_and_keys.append(([layer_idx, i], sus))
-        indices_to_nodes.append([layer_idx, np.unravel_index(i, target_shape)])
+
     return costs_and_keys
 
 
@@ -1427,11 +1382,51 @@ def _extract_costs_list(entry_list):
     return res
 
 
+def _minmax_normalise_costs(costs_and_keys):
+    """
+    Min-max normalise a list of (key, cost) pairs to [0,1] without changing ordering ties.
+    """
+    if not costs_and_keys:
+        return costs_and_keys
+    vals = np.asarray([c for _, c in costs_and_keys], dtype=float)
+    if not np.isfinite(vals).all():
+        return costs_and_keys
+    vmin, vmax = float(vals.min()), float(vals.max())
+    if vmax - vmin < 1e-12:
+        norm_vals = np.zeros_like(vals)
+    else:
+        norm_vals = (vals - vmin) / (vmax - vmin)
+    return [(costs_and_keys[i][0], norm_vals[i]) for i in range(len(costs_and_keys))]
+
+
+def _boost_fi(fail_vals, pass_vals, alpha=10.0, beta=0.5, eps=1e-12, vmin=None, vmax=None):
+    """Boost FI: global min-max -> power -> scale to lift exec signal."""
+    if vmin is None or vmax is None:
+        stacked = np.concatenate([fail_vals, pass_vals]) if pass_vals is not None else fail_vals
+        if stacked.size == 0 or not np.isfinite(stacked).all():
+            return fail_vals, pass_vals
+        vmin = float(stacked.min())
+        vmax = float(stacked.max())
+    if vmax - vmin < eps:
+        norm_fail = np.zeros_like(fail_vals)
+        norm_pass = np.zeros_like(pass_vals) if pass_vals is not None else pass_vals
+    else:
+        norm_fail = (fail_vals - vmin) / (vmax - vmin)
+        norm_pass = (pass_vals - vmin) / (vmax - vmin) if pass_vals is not None else pass_vals
+    norm_fail = np.clip(norm_fail, a_min=0.0, a_max=None)
+    boosted_fail = (norm_fail + eps) ** beta * alpha
+    boosted_pass = None
+    if norm_pass is not None:
+        norm_pass = np.clip(norm_pass, a_min=0.0, a_max=None)
+        boosted_pass = (norm_pass + eps) ** beta * alpha
+    return boosted_fail, boosted_pass
+
+
 def localise_by_qexec_qres_sbfl(
     X, y, predictions, target_weights,
     path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1):
     """
-    Quantised execution (FI-based) + quantised result (probability) SBFL (Ochiai).
+    Quantised execution (FI-based) + quantised result (probability) SBFL (soft Tarantula).
     """
     if predictions.ndim == 1:
         pred_labels = np.round(predictions).astype(int)
@@ -1445,7 +1440,8 @@ def localise_by_qexec_qres_sbfl(
         true_labels = y
 
     correct_mask = pred_labels == true_labels
-    success_scores = np.where(correct_mask, pred_confidence, 0.0)
+    # A: correct samples get a smaller penalty when confidence is high; wrong samples get a larger penalty.
+    success_scores = np.where(correct_mask, 1.0 - pred_confidence, 0.0)
     failure_scores = np.where(~correct_mask, pred_confidence, 0.0)
 
     idx_pass = np.where(success_scores > 0)[0]
@@ -1490,8 +1486,16 @@ def localise_by_qexec_qres_sbfl(
                     fail_vals = np.zeros_like(pass_vals)
                 elif pass_vals.shape[0] == 0:
                     pass_vals = np.zeros_like(fail_vals)
-            total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
-            suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
+
+            # soft Tarantula: compare normalised fail/pass participation (per-weight EF/EP with global totals).
+            fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
+            pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
+
+            ef_tot = float(np.sum(fail_vals)) + eps
+            ep_tot = float(np.sum(pass_vals)) + eps
+            fail_rate = fail_vals / ef_tot
+            pass_rate = pass_vals / ep_tot
+            suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
             for i, sus in enumerate(suspiciousness):
                 costs_and_keys.append(([idx_to_tl, i], sus))
         else:
@@ -1507,26 +1511,145 @@ def localise_by_qexec_qres_sbfl(
                     fail_vals = np.zeros(np.prod(shape))
                 if pass_vals.shape[0] == 0:
                     pass_vals = np.zeros(np.prod(shape))
-                total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
-                suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
+
+                fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
+                pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
+
+                ef_tot = float(np.sum(fail_vals)) + eps
+                ep_tot = float(np.sum(pass_vals)) + eps
+
+                fail_rate = fail_vals / ef_tot
+                pass_rate = pass_vals / ep_tot
+                suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
                 for local_i, sus in enumerate(suspiciousness):
                     costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
 
     return sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
 
 
+def localise_by_qexec_qres_multiplicative(
+    X, y, predictions, target_weights,
+    path_to_keras_model=None,
+    is_multi_label=True,
+    lam=1.0,
+    pass_weight_mode="one_minus_conf",
+    balance=True,
+    eps=1e-12):
+    """
+    Multiplicative qexec-qres localisation.
+
+    FailSignal(w) = Σ_{i in fail} [conf_i * exec_i(w)]   (via sample_weights + sum)
+    PassSignal(w) = Σ_{i in pass} [pass_w_i * exec_i(w)]
+    score(w) = FailSignal(w) - lam * PassSignal(w)
+    """
+    if predictions.ndim == 1:
+        pred_labels = np.round(predictions).astype(int)
+        pred_conf = predictions.flatten()
+    else:
+        pred_labels = np.argmax(predictions, axis=1)
+        pred_conf = predictions[np.arange(len(pred_labels)), pred_labels]
+
+    true_labels = np.argmax(y, axis=1) if (y.ndim > 1) else y
+    correct_mask = pred_labels == true_labels
+
+    idx_pass = np.where(correct_mask)[0]
+    idx_fail = np.where(~correct_mask)[0]
+
+    if len(idx_fail) == 0:
+        return []
+
+    if balance and len(idx_pass) > 0:
+        sample_size = min(len(idx_pass), len(idx_fail))
+        if sample_size > 0:
+            rng = np.random.default_rng()
+            idx_pass = rng.choice(idx_pass, sample_size, replace=False)
+            idx_fail = rng.choice(idx_fail, sample_size, replace=False)
+
+    fail_weights = pred_conf[idx_fail]
+    pass_weights = None
+    if len(idx_pass) > 0 and pass_weight_mode != "none":
+        if pass_weight_mode == "one_minus_conf":
+            pass_weights = 1.0 - pred_conf[idx_pass]
+        elif pass_weight_mode == "conf":
+            pass_weights = pred_conf[idx_pass]
+        else:
+            raise ValueError(f"Unsupported pass_weight_mode: {pass_weight_mode}")
+
+    fail_cands = compute_FI_and_GL(
+        X, y, idx_fail, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=fail_weights,
+        use_gradient_loss=False)
+
+    pass_cands = None
+    if pass_weights is not None and lam != 0.0:
+        pass_cands = compute_FI_and_GL(
+            X, y, idx_pass, target_weights,
+            is_multi_label=is_multi_label,
+            path_to_keras_model=path_to_keras_model,
+            federated=False,
+            sample_weights=pass_weights,
+            use_gradient_loss=False)
+
+    scores_and_keys = []
+    for layer_idx, vs in target_weights.items():
+        t_w, lname = vs
+        fail_entry = fail_cands.get(layer_idx, {"costs": [], "shape": []}) if isinstance(fail_cands, dict) else {}
+        pass_entry = pass_cands.get(layer_idx, {"costs": [], "shape": []}) if isinstance(pass_cands, dict) else {}
+
+        if not model_util.is_LSTM(lname):
+            target_shape = fail_entry.get("shape") or pass_entry.get("shape") or t_w.shape
+            fail_vals = _extract_costs(fail_entry)
+            pass_vals = _extract_costs(pass_entry) if pass_cands is not None and lam != 0.0 else None
+
+            if fail_vals is None or np.asarray(fail_vals).size == 0:
+                fail_vals = np.zeros(int(np.prod(target_shape)), dtype=float)
+            else:
+                fail_vals = np.asarray(fail_vals, dtype=float).reshape(-1)
+
+            if pass_vals is None:
+                pass_vals = np.zeros_like(fail_vals)
+            else:
+                pass_vals = np.asarray(pass_vals, dtype=float).reshape(-1)
+                if pass_vals.shape != fail_vals.shape:
+                    pass_vals = np.zeros_like(fail_vals)
+
+            score = fail_vals - lam * pass_vals
+            for i, s in enumerate(score):
+                scores_and_keys.append(([layer_idx, i], float(s)))
+        else:
+            shapes = fail_entry.get("shape") or pass_entry.get("shape") or [w.shape for w in t_w]
+            fail_list = fail_entry.get("costs", [])
+            pass_list = pass_entry.get("costs", []) if pass_cands is not None and lam != 0.0 else []
+            fail_vals_list = _extract_costs_list(fail_list) if fail_list else []
+            pass_vals_list = _extract_costs_list(pass_list) if pass_list else []
+
+            for idx_to_w, shape in enumerate(shapes):
+                fail_vals = fail_vals_list[idx_to_w] if idx_to_w < len(fail_vals_list) else np.zeros(np.prod(shape))
+                pass_vals = pass_vals_list[idx_to_w] if idx_to_w < len(pass_vals_list) else np.zeros(np.prod(shape))
+                if fail_vals.shape[0] == 0:
+                    fail_vals = np.zeros(np.prod(shape))
+                if pass_vals.shape[0] == 0:
+                    pass_vals = np.zeros(np.prod(shape))
+                score = fail_vals - lam * pass_vals
+                for local_i, s in enumerate(score):
+                    scores_and_keys.append(([(layer_idx, idx_to_w), local_i], float(s)))
+
+    return sorted(scores_and_keys, key=lambda v: v[1], reverse=True)
+
+
 def localise_by_qexec_bres_sbfl(
     X, y, predictions, target_weights,
     path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1):
     """
-    Quantised execution (FI-based) + binary result (pass/fail=1), weighted by prediction confidence.
+    Quantised execution (FI-based) + binary result (pass/fail=1) with soft Tarantula.
     """
     if predictions.ndim == 1:
         pred_labels = np.round(predictions).astype(int)
-        pred_confidence = predictions.flatten()
     else:
         pred_labels = np.argmax(predictions, axis=1)
-        pred_confidence = predictions[np.arange(len(pred_labels)), pred_labels]
     if y.ndim > 1:
         true_labels = np.argmax(y, axis=1)
     else:
@@ -1539,23 +1662,20 @@ def localise_by_qexec_bres_sbfl(
         rng = np.random.default_rng()
         idx_pass = rng.choice(idx_pass, sample_size, replace=False)
         idx_fail = rng.choice(idx_fail, sample_size, replace=False)
-    # align weights with possibly downsampled indices
-    pass_scores = pred_confidence[idx_pass] if len(idx_pass) else np.array([])
-    fail_scores = pred_confidence[idx_fail] if len(idx_fail) else np.array([])
 
     fail_cands = compute_FI_and_GL(
         X, y, idx_fail, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
-        sample_weights=fail_scores if len(fail_scores) else None,
+        sample_weights=None,
         use_gradient_loss=False)
     pass_cands = compute_FI_and_GL(
         X, y, idx_pass, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
-        sample_weights=pass_scores if len(pass_scores) else None,
+        sample_weights=None,
         use_gradient_loss=False)
 
     costs_and_keys = []
@@ -1577,8 +1697,15 @@ def localise_by_qexec_bres_sbfl(
                     fail_vals = np.zeros_like(pass_vals)
                 elif pass_vals.shape[0] == 0:
                     pass_vals = np.zeros_like(fail_vals)
-            total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
-            suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
+            fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
+            pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
+
+            ef_tot = float(np.sum(fail_vals)) + eps
+            ep_tot = float(np.sum(pass_vals)) + eps
+
+            fail_rate = fail_vals / ef_tot
+            pass_rate = pass_vals / ep_tot
+            suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
             for i, sus in enumerate(suspiciousness):
                 costs_and_keys.append(([idx_to_tl, i], sus))
         else:
@@ -1594,8 +1721,15 @@ def localise_by_qexec_bres_sbfl(
                     fail_vals = np.zeros(np.prod(shape))
                 if pass_vals.shape[0] == 0:
                     pass_vals = np.zeros(np.prod(shape))
-                total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
-                suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
+                fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
+                pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
+
+                ef_tot = float(np.sum(fail_vals)) + eps
+                ep_tot = float(np.sum(pass_vals)) + eps
+
+                fail_rate = fail_vals / ef_tot
+                pass_rate = pass_vals / ep_tot
+                suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
                 for local_i, sus in enumerate(suspiciousness):
                     costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
 
@@ -1624,11 +1758,6 @@ def localise_by_bexec_qres_guider(
 
     idx_pass = np.where(success_scores > 0)[0]
     idx_fail = np.where(failure_scores > 0)[0]
-    sample_size = min(len(idx_pass), len(idx_fail))
-    if sample_size > 0:
-        rng = np.random.default_rng()
-        idx_pass = rng.choice(idx_pass, sample_size, replace=False)
-        idx_fail = rng.choice(idx_fail, sample_size, replace=False)
 
     if "hydra" not in str(path_to_keras_model):
         model = load_model(path_to_keras_model, compile=False)
