@@ -176,6 +176,7 @@ def evaluate_method(
             f"loc.{seed}.1.qexec_qres_sbfl.all_cost.pkl",
             f"loc.{seed}.1.qexec_bres_sbfl.all_cost.pkl",
             f"loc.{seed}.1.bexec_qres_guider.all_cost.pkl",
+            f"loc.{seed}.1.bexec_bres_sbfl.all_cost.pkl",
             f"loc.{seed}.1.all_cost.pkl",
         ]
         all_cost_path = None

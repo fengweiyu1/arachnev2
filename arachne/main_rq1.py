@@ -80,7 +80,7 @@ if __name__ == "__main__":
 	parser.add_argument('-which_data', action = "store", default = 'cifar10', type = str, 
 		help = 'fashion_mnist,cifaf10,lfw')
 	parser.add_argument("-loc_method", action = "store", default = None, 
-	help = 'random, localiser, gradient_loss, c_localiser, qexec_qres_sbfl, qexec_bres_sbfl, bexec_qres_guider')
+	help = 'random, localiser, gradient_loss, c_localiser, qexec_qres_sbfl, qexec_bres_sbfl, bexec_qres_guider, bexec_bres_sbfl')
 	parser.add_argument("-seed", action = "store", default = 1, type = int)
 	parser.add_argument("-dest", default = ".", type = str)
 	parser.add_argument("-target_all", type = int, default = 1)
@@ -123,6 +123,9 @@ if __name__ == "__main__":
 	test_X, test_y = test_data
 	# set X and y for the localisation 
 	X,y = train_data if not args.on_test else test_data
+	if args.which_data == 'fashion_mnist':
+		# Faulty FM models expect flattened input shape (None,1,784)
+		X = X.reshape(len(X), 1, -1)
 
 	init_pred_df = read_and_add_flag(args.init_pred_file)
 	init_acc = np.sum(init_pred_df.true == init_pred_df.pred)/len(init_pred_df)

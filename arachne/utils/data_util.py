@@ -113,9 +113,46 @@ def load_data(which, path_to_data,
 		test_data[1] = np.array([vs[1] for vs in sorted_test_vs])
 	elif which in ['fashion_mnist', 'cifar10']:
 		if which == 'fashion_mnist':
-			# Keras has FashionMNIST cached locally; prefer local load
-			from tensorflow.keras.datasets import fashion_mnist
-			(train_X, train_y), (test_X, test_y) = fashion_mnist.load_data(path=path_to_data if isinstance(path_to_data, str) else None)
+			# Prefer local raw IDX files under <path_to_data>/fm/FashionMNIST/raw
+			import gzip, struct
+			raw_dir = os.path.join(path_to_data, "fm", "FashionMNIST", "raw") if isinstance(path_to_data, str) else None
+
+			def read_idx(fname):
+				opener = gzip.open if fname.endswith(".gz") else open
+				with opener(fname, "rb") as f:
+					magic, = struct.unpack(">I", f.read(4))
+					ndim = magic & 0xFF
+					shape = struct.unpack(">" + "I"*ndim, f.read(4*ndim))
+					data = np.frombuffer(f.read(), dtype=np.uint8)
+					return data.reshape(shape)
+
+			if raw_dir and os.path.isdir(raw_dir):
+				img_train_path = os.path.join(raw_dir, "train-images-idx3-ubyte")
+				lbl_train_path = os.path.join(raw_dir, "train-labels-idx1-ubyte")
+				img_test_path = os.path.join(raw_dir, "t10k-images-idx3-ubyte")
+				lbl_test_path = os.path.join(raw_dir, "t10k-labels-idx1-ubyte")
+				# fallback to .gz if plain files not found
+				if not os.path.exists(img_train_path) and os.path.exists(img_train_path + ".gz"):
+					img_train_path += ".gz"
+				if not os.path.exists(lbl_train_path) and os.path.exists(lbl_train_path + ".gz"):
+					lbl_train_path += ".gz"
+				if not os.path.exists(img_test_path) and os.path.exists(img_test_path + ".gz"):
+					img_test_path += ".gz"
+				if not os.path.exists(lbl_test_path) and os.path.exists(lbl_test_path + ".gz"):
+					lbl_test_path += ".gz"
+
+				train_X = read_idx(img_train_path)
+				train_y = read_idx(lbl_train_path)
+				test_X = read_idx(img_test_path)
+				test_y = read_idx(lbl_test_path)
+			else:
+				# Fallback to keras loader; some TF versions support 'path', some don't.
+				from tensorflow.keras.datasets import fashion_mnist
+				try:
+					(train_X, train_y), (test_X, test_y) = fashion_mnist.load_data(
+						path=path_to_data if isinstance(path_to_data, str) else None)
+				except TypeError:
+					(train_X, train_y), (test_X, test_y) = fashion_mnist.load_data()
 			train_X = np.expand_dims(train_X, -1)
 			test_X = np.expand_dims(test_X, -1)
 			train_data = [train_X.astype(np.float32) / 255.0, train_y.astype(np.int64)]
@@ -158,18 +195,18 @@ def load_data(which, path_to_data,
 				test_y = np.array(test_lbl, dtype=np.int64)
 				return (train_X, train_y), (test_X, test_y)
 
-		local = load_cifar_batches(path_to_data)
-		if local is None:
-			from tensorflow.keras.datasets import cifar10
-			(train_X, train_y), (test_X, test_y) = cifar10.load_data()
-			train_y = train_y.flatten()
-			test_y = test_y.flatten()
-			# already channels_last
-		else:
-			(train_X, train_y), (test_X, test_y) = local
+			local = load_cifar_batches(path_to_data)
+			if local is None:
+				from tensorflow.keras.datasets import cifar10
+				(train_X, train_y), (test_X, test_y) = cifar10.load_data()
+				train_y = train_y.flatten()
+				test_y = test_y.flatten()
+				# already channels_last
+			else:
+				(train_X, train_y), (test_X, test_y) = local
 
-		train_data = [train_X.astype(np.float32) / 255.0, train_y.astype(np.int64)]
-		test_data = [test_X.astype(np.float32) / 255.0, test_y.astype(np.int64)]
+			train_data = [train_X.astype(np.float32) / 255.0, train_y.astype(np.int64)]
+			test_data = [test_X.astype(np.float32) / 255.0, test_y.astype(np.int64)]
 	elif which in ['GTSRB', 'us_airline']:
 		import pickle
 		# train

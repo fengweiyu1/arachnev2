@@ -1,6 +1,9 @@
 """
 Localise faults in offline for any faults
 """
+# 本文件核心：实现多种定位算法（FI/GL、SBFL、覆盖等）。
+# 主要流程：选择目标层 -> 计算参与度/梯度 -> 生成可疑权重排序。
+
 import itertools
 
 import numpy as np
@@ -10,20 +13,42 @@ from tensorflow.compat.v1.keras.models import load_model, Model
 import tensorflow.compat.v1.keras.backend as K
 tf.disable_eager_execution()
 from tqdm import tqdm
-import lstm_layer
-import utils.model_util as model_util
+try:
+    from . import lstm_layer
+    from .utils import model_util
+except ImportError:
+    import lstm_layer
+    from utils import model_util
 
 from tensorflow.keras import layers
-from tensorflow.keras.layers import CategoryEncoding
+try:
+    from tensorflow.keras.layers import CategoryEncoding
+except ImportError:
+    # TF1.x fallback for CategoryEncoding
+    class CategoryEncoding(tf.keras.layers.Layer):
+        def __init__(self, num_tokens, output_mode="one_hot", **kwargs):
+            super().__init__(**kwargs)
+            self.num_tokens = num_tokens
+            self.output_mode = output_mode
+
+        def call(self, inputs):
+            return tf.one_hot(inputs, depth=self.num_tokens)
 
 from pathlib import Path
 
 # "divided by zeros" is handleded afterward
 np.seterr(divide='ignore', invalid='ignore')
 
+try:
+    _tf_function = tf.function
+except AttributeError:
+    def _tf_function(fn):
+        return fn
 
 
 
+
+# 自定义层：根据门控输出对分支结果加权融合
 class Combine(layers.Layer):
     """Combine outputs of branches based on gate output."""
 
@@ -69,13 +94,14 @@ class Combine(layers.Layer):
         #    final_outs = out_list.stack()
         #    return final_outs
 
-    @tf.function
+    @_tf_function
     def inner_predict(self, data, num):
         """Gating branch based on gating layer."""
         tf_list = tf.math.argmax(data, 1)
         gate_out = CategoryEncoding(num_tokens=num, output_mode="one_hot")(tf_list)
         return gate_out
 
+# 加载 hydra 模型（json 结构 + h5 权重）
 def load_model_from_h5(model_dir: Path, must_compile=True):
     """
     Loading model from h5
@@ -97,6 +123,7 @@ def load_model_from_h5(model_dir: Path, must_compile=True):
         model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
+# 选择需要定位的层及其权重（支持 Dense/Conv/LSTM）
 def get_target_weights(model, path_to_keras_model, indices_to_target = None):
     """
     return indices to weight layers denoted by indices_to_target, or return all trainable layers
@@ -104,7 +131,7 @@ def get_target_weights(model, path_to_keras_model, indices_to_target = None):
     :param indices_to_target: number of layers to grab as targets. Grab the last X ones that have weights
     """
     import re
-    targeting_clname_pattns = ['Dense*', 'Conv*', '.*LSTM*'] #if not target_all else None
+    targeting_clname_pattns = ['Dense*', 'Conv*', '.*LSTM*', 'BatchNormalization*'] #if not target_all else None
     is_target = lambda clname,targets: (targets is None) or any([bool(re.match(t,clname)) for t in targets])
 
     if model is None:
@@ -117,22 +144,25 @@ def get_target_weights(model, path_to_keras_model, indices_to_target = None):
 
     target_weights = {} # key = layer index, value: [weight value, layer name]
     if indices_to_target is not None:
-        num_layers = len(model.layers)
-
-        for i in range(num_layers-1, -1, -1):
+        # indices_to_target 可以是 int（取最近的若干层）或 list/array（指定层索引）
+        if isinstance(indices_to_target, (list, tuple, np.ndarray)):
+            layer_indices = sorted(set(int(x) for x in np.asarray(indices_to_target).flatten()))
+        else:
+            num_layers = len(model.layers)
+            layer_indices = list(range(num_layers-1, -1, -1))
+        for i in layer_indices:
             layer = model.layers[i]
             ws = layer.get_weights()
             if len(ws) == 0:
                 print("the target layer doesn't have weight")
                 continue
             elif model_util.is_BatchNorm(type(layer).__name__):
-                print(f"skipped layer num {i}, had weights but is of type {type(layer).__name__}")
-                continue
+                # Keep BN trainable params (gamma/beta); skip non-trainable running stats
+                target_weights[i] = [ws[:2], type(layer).__name__]
             else:
-                #target_weights[i] = ws[0] # we will target only the weight, and not the bias
                 target_weights[i] = [ws[0], type(layer).__name__]
-            if len(target_weights) >= indices_to_target:  # when we found enough layers, break
-                print(f"out of {num_layers} layers, we will localize weights in layers: {str(target_weights.keys())}")
+            if not isinstance(indices_to_target, (list, tuple, np.ndarray)) and len(target_weights) >= indices_to_target:
+                print(f"out of {len(model.layers)} layers, we will localize weights in layers: {str(target_weights.keys())}")
                 break
     else:
         for i, layer in enumerate(model.layers):
@@ -142,6 +172,8 @@ def get_target_weights(model, path_to_keras_model, indices_to_target = None):
                 if len(ws): # has weight
                     if model_util.is_FC(class_name) or model_util.is_C2D(class_name):
                         target_weights[i] = [ws[0], type(layer).__name__]
+                    elif model_util.is_BatchNorm(class_name):
+                        target_weights[i] = [ws[:2], type(layer).__name__]
                     elif model_util.is_LSTM(class_name):
                         # for LSTM, even without bias, a fault can be in the weights of the kernel
                         # or the recurrent kernel (hidden state handling)
@@ -155,21 +187,33 @@ def get_target_weights(model, path_to_keras_model, indices_to_target = None):
     return target_weights
 
 
-def _normalise_sample_weights(num, sample_weights):
+# 样本权重清洗（裁剪负数，不做归一化）
+def _clean_sample_weights(num, sample_weights):
     """
-    Normalise sample weights to sum to 1; returns None when weights are absent or all-zero.
+    Validate/clean sample weights; returns None when weights are absent or all-zero.
     """
     if sample_weights is None:
         return None
     weights = np.asarray(sample_weights, dtype=float).flatten()
     assert len(weights) == num, f"Weight length {len(weights)} does not match number of samples {num}"
     weights = np.clip(weights, a_min=0.0, a_max=None)
-    total = np.sum(weights)
-    if total == 0:
+    if np.sum(weights) == 0:
         return None
-    return weights / total
+    return weights
 
 
+# 样本权重归一化（和为 1；全零返回 None）
+def _normalise_sample_weights(num, sample_weights):
+    """
+    Normalise sample weights to sum to 1; returns None when weights are absent or all-zero.
+    """
+    weights = _clean_sample_weights(num, sample_weights)
+    if weights is None:
+        return None
+    return weights / np.sum(weights)
+
+
+# 按样本权重做加权平均
 def _weighted_mean(arr, weights):
     """
     Weighted mean over axis 0; defaults to arithmetic mean when weights are None.
@@ -179,42 +223,37 @@ def _weighted_mean(arr, weights):
     return np.tensordot(weights, arr, axes=([0], [0]))
 
 
-def _weighted_agg(arr, weights, mode="mean"):
-    """
-    Weighted aggregation over axis 0.
-
-    mode="mean": sum(w * arr) / sum(w)
-    mode="sum" : sum(w * arr)   (keeps magnitude; better to reflect qres strength)
-    """
-    if weights is None:
-        return np.mean(arr, axis=0) if mode == "mean" else np.sum(arr, axis=0)
-
-    w = np.asarray(weights, dtype=float).reshape(-1)
-    if w.size == 0:
-        return np.mean(arr, axis=0) if mode == "mean" else np.sum(arr, axis=0)
-
-    if mode == "mean":
-        denom = float(np.sum(w))
-        if denom <= 0:
-            return np.mean(arr, axis=0)
-        w = w / denom
-        return np.tensordot(w, arr, axes=([0], [0]))
-    elif mode == "sum":
-        return np.tensordot(w, arr, axes=([0], [0]))
-    else:
-        raise ValueError(f"Unsupported mode: {mode}")
+# L1-normalise FI values (vector or per-sample matrix).
+def _normalise_fi_values(values, eps=1e-12):
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return arr
+    if arr.ndim == 1:
+        denom = np.sum(np.abs(arr))
+        if denom <= eps:
+            return arr
+        return arr / denom
+    if arr.ndim == 2:
+        denom = np.sum(np.abs(arr), axis=1, keepdims=True)
+        denom = np.where(denom > eps, denom, 1.0)
+        return arr / denom
+    denom = np.sum(np.abs(arr), axis=-1, keepdims=True)
+    denom = np.where(denom > eps, denom, 1.0)
+    return arr / denom
 
 
+# 计算输出对目标层输出/权重的梯度（可按样本加权）
 def compute_gradient_to_output(path_to_keras_model, 
     idx_to_target_layer, X,
     by_batch = False, on_weight = False, wo_reset = False,federated=False,
-    sample_weights = None):
+    sample_weights = None,
+    normalise_sample_weights = True):
     """
     compute gradients normalisesd and averaged for a given input X
     on_weight = False -> on output of idx_to_target_layer'th layer
     """
     from sklearn.preprocessing import Normalizer
-    from collections.abc import Iterable
+    from collections.abc import Iterable           
     norm_scaler = Normalizer(norm = "l1")
 
     #model = load_model(path_to_keras_model, compile = False)
@@ -245,13 +284,10 @@ def compute_gradient_to_output(path_to_keras_model,
     else:
         chunks = [np.arange(num)]
 
-    weights = None
-    if sample_weights is not None:
-        weights = np.asarray(sample_weights, dtype=float).flatten()
-        assert len(weights) == num, f"Weight length {len(weights)} does not match number of samples {num}"
-        weights = np.clip(weights, a_min=0.0, a_max=None)
-        if np.sum(weights) == 0:
-            weights = None
+    if normalise_sample_weights:
+        weights = _normalise_sample_weights(num, sample_weights)
+    else:
+        weights = _clean_sample_weights(num, sample_weights)
 
     if not on_weight:
         grad_shape = tuple([num] + [int(v) for v in tensor_grad[0].shape[1:]])
@@ -266,13 +302,19 @@ def compute_gradient_to_output(path_to_keras_model,
         gradient = np.abs(gradient)
 
         reshaped_gradient = gradient.reshape(gradient.shape[0],-1) # flatten
-        norm_gradient = norm_scaler.fit_transform(reshaped_gradient) # normalised
+        # NOTE: normalization disabled for inspection
+        # norm_gradient = norm_scaler.fit_transform(reshaped_gradient) # normalised
+        norm_gradient = reshaped_gradient
 
+        # If no sample weights provided, return per-sample gradients
+        if weights is None:
+            # Return [n_samples, ...] - per-sample normalized gradients
+            ret_gradient = norm_gradient.reshape(gradient.shape)
+        else:
+            # Aggregate with weights and return single gradient vector
+            mean_gradient = _weighted_mean(norm_gradient, weights) # compute mean for a given input
+            ret_gradient = mean_gradient.reshape(gradient.shape[1:]) # reshape to the orignal shape
 
-        # Keep magnitude so that higher qres (weights) produces larger aggregated signal.
-        mean_gradient = _weighted_agg(norm_gradient, weights, mode="sum")
-
-        ret_gradient = mean_gradient.reshape(gradient.shape[1:]) # reshape to the orignal shape
         #print("after mean and reshape", ret_gradient.shape)
         if not wo_reset:
             reset_keras([tensor_grad])
@@ -298,6 +340,7 @@ def compute_gradient_to_output(path_to_keras_model,
             return ret_gradients
 
 
+# 计算损失对目标层权重的梯度（GL）
 def compute_gradient_to_loss(path_to_keras_model, idx_to_target_layer, X, y, 
     by_batch = False, wo_reset = False, loss_func = 'categorical_cross_entropy', federated=False, **kwargs):
     """
@@ -377,6 +420,7 @@ def compute_gradient_to_loss(path_to_keras_model, idx_to_target_layer, X, y,
     return gradients[0] if len(gradients) == 1 else gradients
 
 
+# 重置 Keras/TensorFlow 会话，清理计算图与缓存
 def reset_keras(delete_list = None, frac = 1):
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction = frac)
     config = tf.ConfigProto(gpu_options=gpu_options)
@@ -396,28 +440,66 @@ def reset_keras(delete_list = None, frac = 1):
         gc.collect()
         K.set_session(tf.Session(config = config))
 
+# 随机采样未变化样本，使 changed/unchanged 数量接近
 def sample_input_for_loc_by_rd(
     indices_to_chgd,
     indices_to_unchgd,
     predictions = None, ys = None):
     """
+    Down-sample changed/unchanged to the same size to avoid extreme imbalance.
+    If predictions/ys are given, unchanged sampling keeps label distribution.
     """
     num_chgd = len(indices_to_chgd)
-    if num_chgd >= len(indices_to_unchgd): # no need to do any sampling
+    num_unchgd = len(indices_to_unchgd)
+    if num_chgd == 0 or num_unchgd == 0:
         return indices_to_chgd, indices_to_unchgd
 
-    if predictions is None and ys is None:
-        sampled_indices_to_unchgd = np.random.choice(indices_to_unchgd, num_chgd, replace = False)
-        return indices_to_chgd, sampled_indices_to_unchgd
+    num_sample = min(num_chgd, num_unchgd)
+
+    # sample changed
+    if num_sample < num_chgd:
+        sampled_indices_to_chgd = np.random.choice(indices_to_chgd, num_sample, replace=False)
     else:
-        _, sampled_indices_to_unchgd = sample_input_for_loc_sophis(
+        sampled_indices_to_chgd = indices_to_chgd
+
+    # sample unchanged (optionally stratified by label)
+    if predictions is None and ys is None:
+        sampled_indices_to_unchgd = np.random.choice(indices_to_unchgd, num_sample, replace=False)
+    else:
+        # reuse sophis sampler to keep label distribution, then cap to num_sample
+        _, cand_unchgd = sample_input_for_loc_sophis(
             indices_to_chgd,
             indices_to_unchgd,
             predictions, ys)
+        if len(cand_unchgd) > num_sample:
+            sampled_indices_to_unchgd = np.random.choice(cand_unchgd, num_sample, replace=False)
+        else:
+            sampled_indices_to_unchgd = cand_unchgd
 
-        return indices_to_chgd, sampled_indices_to_unchgd
+    return sampled_indices_to_chgd, sampled_indices_to_unchgd
 
 
+# 外层 min-min 采样：changed/unchanged 都下采样到最小值
+def sample_input_for_loc_by_minmin(
+    indices_to_chgd,
+    indices_to_unchgd):
+    """
+    """
+    num_chgd = len(indices_to_chgd)
+    num_unchgd = len(indices_to_unchgd)
+    if num_chgd == 0 or num_unchgd == 0:
+        return indices_to_chgd, indices_to_unchgd
+
+    num_sample = min(num_chgd, num_unchgd)
+    if num_sample == num_chgd and num_sample == num_unchgd:
+        return indices_to_chgd, indices_to_unchgd
+
+    sampled_indices_to_chgd = np.random.choice(indices_to_chgd, num_sample, replace = False)
+    sampled_indices_to_unchgd = np.random.choice(indices_to_unchgd, num_sample, replace = False)
+    return sampled_indices_to_chgd, sampled_indices_to_unchgd
+
+
+# 按类别比例采样未变化样本，保持分布一致性
 def sample_input_for_loc_sophis(
     indices_to_chgd,
     indices_to_unchgd,
@@ -475,6 +557,7 @@ def sample_input_for_loc_sophis(
     return indices_to_chgd, sampled_indices_to_unchgd
 
 #@tf.function
+# 核心：计算 FI（前向影响×后向梯度）与可选 GL
 def compute_FI_and_GL(
     X, y,
     indices_to_target,
@@ -483,9 +566,14 @@ def compute_FI_and_GL(
     path_to_keras_model = None,
     federated = False,
     sample_weights = None,
-    use_gradient_loss = True):
+    normalise_sample_weights = True,
+    use_gradient_loss = True,
+    aggregate = True):
     """
     compute FL and GL for the given inputs
+
+    Args:
+        aggregate: If True (default), aggregate across samples. If False, preserve sample dimension.
     """
     if len(indices_to_target) == 0:
         return {}
@@ -493,9 +581,9 @@ def compute_FI_and_GL(
     ## Now, start localisation !!! ##
     from sklearn.preprocessing import Normalizer
     from collections.abc import Iterable
-    norm_scaler = Normalizer(norm = "l1")
+    norm_scaler = Normalizer(norm = "l1")  #归一化处理
     total_cands = {}
-    FIs = None; grad_scndcr = None
+    FIs = None; grad_scndcr = None  #最终输出可疑权重字典 
 
     # For FedRep: dictionaries for intermediate scores of FI
     avg_activations = {}
@@ -508,13 +596,13 @@ def compute_FI_and_GL(
     target_y = y[indices_to_target]
     weights = None
     if sample_weights is not None:
-        weights = np.asarray(sample_weights, dtype=float).flatten()
+        weights = np.asarray(sample_weights, dtype = float).flatten()
         if len(weights) != len(target_X):
             weights = weights[indices_to_target]
-        # Keep magnitude for sum aggregation (qexec × qres); only clip negatives and drop all-zero.
-        weights = np.clip(weights, a_min=0.0, a_max=None)
-        if np.sum(weights) == 0:
-            weights = None
+        if normalise_sample_weights:
+            weights = _normalise_sample_weights(len(target_X), weights)
+        else:
+            weights = _clean_sample_weights(len(target_X), weights)
 
     # get loss func
     loss_func = model_util.get_loss_func(is_multi_label = is_multi_label)
@@ -549,25 +637,47 @@ def compute_FI_and_GL(
                 assert int(prev_output.shape[-1]) == t_w.shape[0], "{} vs {}".format(
                     int(prev_output.shape[-1]), t_w.shape[0])
 
-                output = np.multiply(prev_output, t_w[:,idx]) # -> shape = prev_output.shape
+                output = np.multiply(prev_output, t_w[:,idx]) # prev_output: 上一层的激活值 (Activation)# t_w[:,idx]: 当前神经元的权重 (Weight)  # -> shape = prev_output.shape
                 output = np.abs(output)
-                output = norm_scaler.fit_transform(output)
-                #print("BEfore mean",output.shape)
-                # exec × qres aggregation: sum_i (w_i * exec_i)
-                output = _weighted_agg(output, weights, mode="sum")
-                #print(output.shape)
+                # NOTE: normalization disabled for inspection
+                # output = norm_scaler.fit_transform(output)
+                if aggregate:
+                    #print("BEfore mean",output.shape)
+                    output = _weighted_mean(output, weights)
+                    #print(output.shape)
+
                 from_front.append(output)
 
             from_front = np.asarray(from_front)
 
-
-            from_front = from_front.T
+            if aggregate:
+                from_front = from_front.T  # [n_features, n_neurons]
+            else:
+                # from_front 当前是 [n_neurons, n_samples, n_features]
+                from_front = np.transpose(from_front, (1, 2, 0))  # [n_samples, n_features, n_neurons]
             from_behind = compute_gradient_to_output(
-                path_to_keras_model, idx_to_tl, target_X,federated=federated, sample_weights = weights)
+                path_to_keras_model, idx_to_tl, target_X,federated=federated,
+                sample_weights = weights if aggregate else None,
+                normalise_sample_weights = normalise_sample_weights)
+            if from_behind.ndim == 3 and from_behind.shape[1] == 1:
+                # Dense outputs may carry a singleton dim (N,1,units); remove it to avoid N×N broadcast.
+                from_behind = np.squeeze(from_behind, axis=1)
+            if aggregate and from_behind.ndim == 2:
+                # Some backends return per-sample gradients in aggregate mode.
+                from_behind = np.mean(from_behind, axis=0)
 
             #print ("shape", from_front.shape, from_behind.shape)
             #print(from_behind)
-            FIs = from_front * from_behind
+            if aggregate:
+                FIs = from_front * from_behind
+            else:
+                # from_front: [n_samples, n_features, n_neurons]
+                # from_behind: [n_neurons] (聚合后) 或 [n_samples, n_neurons] (未聚合)
+                if from_behind.ndim == 1:
+                    FIs = from_front * from_behind[np.newaxis, np.newaxis, :]
+                else:
+                    # from_behind: [n_samples, n_neurons]
+                    FIs = from_front * from_behind[:, np.newaxis, :]
             print(f"FI shape {FIs.shape}")
             ############ FI end #########
 
@@ -697,34 +807,63 @@ def compute_FI_and_GL(
                         #avg_output = np.mean(output,axis=0)
                         #output = output#/sum_output
                         output = np.nan_to_num(output, posinf = 0.)
-                        # exec × qres aggregation: sum_i (w_i * exec_i)
-                        output = _weighted_agg(output, weights, mode="sum")
+                        if aggregate:
+                            output = _weighted_mean(output, weights)
+                        # else: 保留 [n_samples, ...] 维度
                         from_front.append(output)
 
             from_front = np.asarray(from_front)
 
-            #from_front.shape: [Channel_out * n_mv_0 * n_mv_1, F1, F2, Channel_in]
-            if is_channel_first:
-                from_front = from_front.reshape(
-                    (n_output_channel,n_mv_0,n_mv_1,kernel_shape[0],kernel_shape[1],int(prev_output.shape[1])))
-            else: # channels_last
-                from_front = from_front.reshape(
-                    (n_mv_0,n_mv_1,n_output_channel,kernel_shape[0],kernel_shape[1],int(prev_output.shape[-1])))
+            #from_front.shape: [Channel_out * n_mv_0 * n_mv_1, F1, F2, Channel_in] if aggregate
+            #                  [Channel_out * n_mv_0 * n_mv_1, n_samples, F1, F2, Channel_in] if not aggregate
+            if aggregate:
+                if is_channel_first:
+                    from_front = from_front.reshape(
+                        (n_output_channel,n_mv_0,n_mv_1,kernel_shape[0],kernel_shape[1],int(prev_output.shape[1])))
+                else: # channels_last
+                    from_front = from_front.reshape(
+                        (n_mv_0,n_mv_1,n_output_channel,kernel_shape[0],kernel_shape[1],int(prev_output.shape[-1])))
 
-            # [F1,F2,Channel_in, Channel_out, n_mv_0, n_mv_1]
-            # 	or [F1,F2,Channel_in, n_mv_0, n_mv_1,Channel_out]
-            from_front = np.moveaxis(from_front, [0,1,2], [3,4,5])
+                # [F1,F2,Channel_in, Channel_out, n_mv_0, n_mv_1]
+                # 	or [F1,F2,Channel_in, n_mv_0, n_mv_1,Channel_out]
+                from_front = np.moveaxis(from_front, [0,1,2], [3,4,5])
+            else:
+                # 保留样本维度的reshape
+                n_samples = target_X.shape[0]
+                if is_channel_first:
+                    from_front = from_front.reshape(
+                        (n_output_channel,n_mv_0,n_mv_1,n_samples,kernel_shape[0],kernel_shape[1],int(prev_output.shape[1])))
+                    from_front = np.moveaxis(from_front, [0,1,2,3], [4,5,6,0])  # [n_samples, F1, F2, Channel_in, Channel_out, n_mv_0, n_mv_1]
+                else: # channels_last
+                    from_front = from_front.reshape(
+                        (n_mv_0,n_mv_1,n_output_channel,n_samples,kernel_shape[0],kernel_shape[1],int(prev_output.shape[-1])))
+                    from_front = np.moveaxis(from_front, [0,1,2,3], [4,5,6,0])  # [n_samples, F1, F2, Channel_in, n_mv_0, n_mv_1, Channel_out]
 
-            # [Channel_out, H_out(n_mv_0), W_out(n_mv_1)]
+            # [Channel_out, H_out(n_mv_0), W_out(n_mv_1)] or [n_samples, Channel_out, H_out, W_out]
             from_behind = compute_gradient_to_output(
                 path_to_keras_model, idx_to_tl, target_X, by_batch = False,federated=federated,
-                sample_weights = weights)
+                sample_weights = weights if aggregate else None,
+                normalise_sample_weights = normalise_sample_weights)
+            if aggregate and from_behind.ndim == 4:
+                # Some backends return per-sample gradients even in aggregate mode.
+                # Reduce over samples to match the [C_out, H, W] shape expected here.
+                from_behind = np.mean(from_behind, axis=0)
 
             #t1 = time.time()
             # [F1,F2,Channel_in, Channel_out, n_mv_0, n_mv_1] (channels_firs)
             # or [F1,F2,Channel_in,n_mv_0, n_mv_1,Channel_out] (channels_last)
             #print(from_front.shape,from_behind.shape)
-            FIs = from_front * from_behind
+            if aggregate:
+                FIs = from_front * from_behind
+            else:
+                # from_front: [n_samples, F1, F2, Channel_in, ...]
+                # from_behind: [Channel_out, H_out, W_out] 或 [n_samples, Channel_out, H_out, W_out]
+                if from_behind.ndim == 3:
+                    # 需要广播到样本维度
+                    FIs = from_front * from_behind[np.newaxis, ...]
+                else:
+                    # 已经有样本维度
+                    FIs = from_front * from_behind[:, np.newaxis, np.newaxis, np.newaxis, ...]
 
 
             # Artifically isolate from_behind and from_front
@@ -741,14 +880,22 @@ def compute_FI_and_GL(
             #t2 = time.time()
             #print ('Time for multiplying front and behind results: {}'.format(t2 - t1))
             #FIs = np.mean(np.mean(FIs, axis = -1), axis = -1) # [F1, F2, Channel_in, Channel_out]
-            if is_channel_first:
-                FIs = np.sum(np.sum(FIs, axis = -1), axis = -1) # [F1, F2, Channel_in, Channel_out]
+            if aggregate:
+                if is_channel_first:
+                    FIs = np.sum(np.sum(FIs, axis = -1), axis = -1) # [F1, F2, Channel_in, Channel_out]
+                else:
+                    if not federated:
+                        np.save("origAct",masked_front)
+                        np.save("origOut",masked_behind)
+                    FIs = np.sum(np.sum(FIs, axis=-2), axis=-2)
             else:
-
-                if not federated:
-                    np.save("origAct",masked_front)
-                    np.save("origOut",masked_behind)
-                FIs = np.sum(np.sum(FIs, axis=-2), axis=-2)
+                # 非聚合模式：需要保留样本维度
+                if is_channel_first:
+                    # [n_samples, F1, F2, Channel_in, Channel_out, n_mv_0, n_mv_1]
+                    FIs = np.sum(np.sum(FIs, axis = -1), axis = -1) # [n_samples, F1, F2, Channel_in, Channel_out]
+                else:
+                    # [n_samples, F1, F2, Channel_in, n_mv_0, n_mv_1, Channel_out]
+                    FIs = np.sum(np.sum(FIs, axis=-3), axis=-3) # [n_samples, F1, F2, Channel_in, Channel_out]
 
 
             #from_behind = masked_behind
@@ -764,6 +911,83 @@ def compute_FI_and_GL(
                     or (isinstance(grad_scndcr, list) and len(grad_scndcr) == 0):
                 print("grad_scndcr type: " + str(type(grad_scndcr)))
                 print("grad_scndcr shape: " + str(grad_scndcr.shape))
+        elif model_util.is_BatchNorm(lname):
+            # FI = front (activation influence) * back (output gradient), per gamma/beta channel
+            # Get BN output activations
+            if idx_to_tl == 0 or idx_to_tl - 1 == 0:
+                bn_out = model.layers[idx_to_tl](target_X, training=False)
+                bn_out = K.get_session().run(bn_out)
+            else:
+                t_model = Model(inputs=model.input, outputs=model.layers[idx_to_tl].output)
+                bn_out = t_model.predict(target_X)
+
+            layer_config = model.layers[idx_to_tl].get_config()
+            axis = layer_config.get('axis', -1)
+            # move channel axis to last for consistent reduction
+            if isinstance(axis, (list, tuple)):
+                axis = axis[0]
+            if axis < 0:
+                axis = bn_out.ndim + axis
+            if axis != bn_out.ndim - 1:
+                bn_out = np.moveaxis(bn_out, axis, -1)
+
+            def _reduce_to_channels(arr):
+                arr = np.abs(arr)
+                if arr.ndim <= 1:
+                    return arr
+                reshaped = arr.reshape(arr.shape[0], -1, arr.shape[-1])
+                return np.mean(reshaped, axis=1)
+
+            front_base = _reduce_to_channels(bn_out)
+
+            # NOTE: normalization disabled for inspection
+            # front_gamma = norm_scaler.fit_transform(front_base)
+            # front_beta = norm_scaler.fit_transform(np.ones_like(front_base))
+            front_gamma = front_base
+            front_beta = np.ones_like(front_base)
+            if aggregate:
+                front_gamma = _weighted_mean(front_gamma, weights)
+                front_beta = _weighted_mean(front_beta, weights)
+
+            back_full = compute_gradient_to_output(
+                path_to_keras_model, idx_to_tl, target_X, by_batch=False,
+                federated=federated, sample_weights=weights if aggregate else None,
+                normalise_sample_weights=normalise_sample_weights)
+
+            if aggregate:
+                if back_full.ndim > 1:
+                    back_ch = np.mean(back_full.reshape(-1, back_full.shape[-1]), axis=0)
+                else:
+                    back_ch = back_full
+
+                FIs_gamma = front_gamma * back_ch
+                FIs_beta = front_beta * back_ch
+                FIs = np.asarray([FIs_gamma, FIs_beta])
+
+                masked_front = np.asarray([front_gamma, front_beta])
+                masked_behind = np.asarray([back_ch, back_ch])
+            else:
+                # 保留样本维度
+                if back_full.ndim > 1:
+                    back_ch = np.mean(back_full.reshape(back_full.shape[0], -1, back_full.shape[-1]), axis=1)
+                else:
+                    back_ch = back_full
+
+                FIs_gamma = front_gamma * back_ch  # [n_samples, n_channels]
+                FIs_beta = front_beta * back_ch    # [n_samples, n_channels]
+                FIs = np.asarray([FIs_gamma, FIs_beta])  # [2, n_samples, n_channels]
+                FIs = np.transpose(FIs, (1, 0, 2))  # [n_samples, 2, n_channels]
+
+                masked_front = np.asarray([front_gamma, front_beta])
+                masked_behind = np.asarray([back_ch, back_ch])
+
+            grad_scndcr = None
+            if use_gradient_loss:
+                grad_scndcr = compute_gradient_to_loss(
+                    path_to_keras_model, idx_to_tl, target_X, target_y,
+                    by_batch=False, loss_func=loss_func, federated=federated)
+                if isinstance(grad_scndcr, list):
+                    grad_scndcr = np.asarray(grad_scndcr[:len(t_w)])
         elif model_util.is_LSTM(lname): #
             from scipy.special import expit as sigmoid
             num_weights = 2
@@ -866,7 +1090,8 @@ def compute_FI_and_GL(
 
             ## from behind
             from_behind = compute_gradient_to_output(
-                path_to_keras_model, idx_to_tl, target_X, by_batch = True, sample_weights = weights) # shape = (num_units,)
+                path_to_keras_model, idx_to_tl, target_X, by_batch = True, sample_weights = weights,
+                normalise_sample_weights = normalise_sample_weights) # shape = (num_units,)
 
             #t1 = time.time()
             # shape = (N_k_rk_w, num_units)
@@ -919,17 +1144,30 @@ def compute_FI_and_GL(
                 print("FIs was a list, now has shape:")
                 print(FIs.shape)
 
-            if federated:
-                if grad_scndcr is not None:
-                    pairs = np.asarray([grad_scndcr.flatten()]).T
+            if aggregate:
+                # 原来的聚合逻辑
+                if federated:
+                    if grad_scndcr is not None:
+                        pairs = np.asarray([grad_scndcr.flatten()]).T
+                    else:
+                        pairs = np.asarray([FIs.flatten()]).T
                 else:
-                    pairs = np.asarray([FIs.flatten()]).T
+                    if grad_scndcr is None:
+                        pairs = np.asarray([FIs.flatten()]).T
+                    else:
+                        pairs = np.asarray([grad_scndcr.flatten(), FIs.flatten()]).T
+                total_cands[idx_to_tl] = {'shape':FIs.shape, 'costs':pairs}
             else:
-                if grad_scndcr is None:
-                    pairs = np.asarray([FIs.flatten()]).T
-                else:
-                    pairs = np.asarray([grad_scndcr.flatten(), FIs.flatten()]).T
-            total_cands[idx_to_tl] = {'shape':FIs.shape, 'costs':pairs}
+                # 新逻辑：保留样本维度
+                # FIs: [n_samples, n_features, n_neurons] or similar
+                # 需要重塑为 [n_samples, n_params]
+                original_shape = FIs.shape[1:]  # 保存权重形状（不含样本维度）
+                FIs_flat = FIs.reshape(FIs.shape[0], -1)  # [n_samples, n_params]
+                total_cands[idx_to_tl] = {
+                    'shape': original_shape,
+                    'costs': FIs_flat,
+                    'per_sample': True
+                }
         else: # currently, all of them go into here
             total_cands[idx_to_tl] = {'shape':[], 'costs':[]}
             pairs = []
@@ -963,6 +1201,37 @@ def compute_FI_and_GL(
         return total_cands, avg_activations, output_grads
 
 
+def compute_FI_and_GL_by_sample(
+    X, y,
+    indices_to_target,
+    target_weights,
+    is_multi_label = True,
+    path_to_keras_model = None,
+    federated = False,
+    sample_weights = None,  # kept for API compatibility but not used
+    normalise_sample_weights = True,
+    use_gradient_loss = True):
+    """
+    Per-sample version of compute_FI_and_GL.
+    Uses aggregate=False to compute all samples in one batch while preserving
+    the sample dimension, which is much more efficient than repeated single-sample
+    evaluations.
+
+    Note: sample_weights parameter is kept for API compatibility but is not used
+    in non-aggregated mode to preserve per-sample FI values.
+    """
+    return compute_FI_and_GL(
+        X, y, indices_to_target, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=federated,
+        sample_weights=None,  # 不使用样本权重，保持所有样本同等权重
+        normalise_sample_weights=normalise_sample_weights,
+        use_gradient_loss=use_gradient_loss,
+        aggregate=False)
+
+
+# LSTM：计算单个权重的前向影响
 def compute_output_per_w(x, h, t_w_kernel, t_w_recurr_kernel, const, with_norm = False): 
     """
     A slice for a single neuron (unit or lstm cell)
@@ -989,7 +1258,8 @@ def compute_output_per_w(x, h, t_w_kernel, t_w_recurr_kernel, const, with_norm =
     out = np.abs(out)
     if with_norm:
         original_shape = out.shape
-        out = norm_scaler.fit_transform(out.flatten().reshape(1,-1)).reshape(-1,)
+        # NOTE: normalization disabled for inspection
+        # out = norm_scaler.fit_transform(out.flatten().reshape(1,-1)).reshape(-1,)
         out = out.reshape(original_shape)
 
     # N = num_features or num_features + num_units
@@ -997,6 +1267,7 @@ def compute_output_per_w(x, h, t_w_kernel, t_w_recurr_kernel, const, with_norm =
     return out
 
 
+# LSTM：为门控计算常量项
 def get_constants(gate, F, I, C, O, cell_states):
     """
     """
@@ -1016,6 +1287,7 @@ def get_constants(gate, F, I, C, O, cell_states):
         return np.tanh(cell_states[:,1:,:])
 
 
+# LSTM：计算前向影响（所有门控/权重）
 def lstm_local_front_FI_for_target_all(
     x, h, num_units,
     t_w_kernels, t_w_recurr_kernels, consts,
@@ -1056,8 +1328,10 @@ def lstm_local_front_FI_for_target_all(
         # the absence of act and the scaling in the middle, etc.)
         original_shape = out_combined.shape
         # normalised
-        scaled_out_combined = norm_scaler.fit_transform(np.abs(out_combined).flatten().reshape(1,-1))
-        scaled_out_combined = scaled_out_combined.reshape(original_shape)
+        # NOTE: normalization disabled for inspection
+        # scaled_out_combined = norm_scaler.fit_transform(np.abs(out_combined).flatten().reshape(1,-1))
+        # scaled_out_combined = scaled_out_combined.reshape(original_shape)
+        scaled_out_combined = np.abs(out_combined)
         # mean out_combined's shape: ((num_features + num_units) * 4,)
         # for each neural weight, the average over both time step and the batch
         avg_scaled_out_combined = np.mean(
@@ -1070,6 +1344,7 @@ def lstm_local_front_FI_for_target_all(
     return from_front, gate_orders
 
 
+# BL 方法：changed/unchanged 分别计算并做 Pareto 过滤
 def localise_by_chgd_unchgd(
     X, y,
     indices_to_chgd,
@@ -1156,6 +1431,108 @@ def localise_by_chgd_unchgd(
     return pareto_front, costs_and_keys
 
 
+def _select_by_confidence(indices, confidences, sample_size, top=True):
+    """
+    Choose sample_size entries from indices according to confidence ordering.
+    top=True => highest confidence; top=False => lowest confidence.
+    """
+    if sample_size <= 0 or len(indices) == 0:
+        return np.zeros(0, dtype=int)
+    idx_arr = np.asarray(indices)
+    conf_arr = np.asarray(confidences)
+    order = np.argsort(conf_arr)
+    if top:
+        sel = order[::-1][:sample_size]
+    else:
+        sel = order[:sample_size]
+    return idx_arr[sel]
+
+
+def sample_for_extent_sbfl(
+    idx_pass, idx_fail,
+    probs, pred_labels, true_labels,
+    sample_size=None):
+    """
+    Sample based on error extent.
+
+    Sampling:
+    - Fail: select samples with highest error degree (most confidently wrong)
+    - Pass: select samples with highest correctness (most confidently right)
+
+    Returns:
+        selected_idx_pass, selected_idx_fail, pass_weights, fail_weights
+    """
+    idx_pass = np.asarray(idx_pass, dtype=int)
+    idx_fail = np.asarray(idx_fail, dtype=int)
+    if sample_size is None:
+        sample_size = min(len(idx_pass), len(idx_fail))
+    if sample_size <= 0 or (len(idx_pass) == 0 and len(idx_fail) == 0):
+        return (np.array([], dtype=int), np.array([], dtype=int),
+                np.array([], dtype=float), np.array([], dtype=float))
+
+    probs_arr = np.asarray(probs)
+    pred_labels = np.asarray(pred_labels)
+    true_labels = np.asarray(true_labels)
+
+    def compute_error_degree(indices):
+        if len(indices) == 0:
+            return np.array([], dtype=float)
+        if probs_arr.ndim == 2 and probs_arr.shape[1] > 1:
+            true_probs = probs_arr[indices, true_labels[indices]]
+            pred_probs = probs_arr[indices, pred_labels[indices]]
+            error_degree = pred_probs - true_probs
+        else:
+            probs_flat = probs_arr.flatten() if probs_arr.ndim > 1 else probs_arr
+            error_degree = np.abs(probs_flat[indices] - true_labels[indices])
+        return np.clip(error_degree, 0.0, 1.0)
+
+    def compute_correctness(indices):
+        if len(indices) == 0:
+            return np.array([], dtype=float)
+        if probs_arr.ndim == 2 and probs_arr.shape[1] > 1:
+            correctness = probs_arr[indices, true_labels[indices]]
+        else:
+            probs_flat = probs_arr.flatten() if probs_arr.ndim > 1 else probs_arr
+            correctness = np.where(
+                true_labels[indices] == 1,
+                probs_flat[indices],
+                1.0 - probs_flat[indices]
+            )
+        return np.clip(correctness, 0.0, 1.0)
+
+    all_fail_error = compute_error_degree(idx_fail)
+    all_pass_correct = compute_correctness(idx_pass)
+
+    if len(idx_fail) > 0:
+        if len(idx_fail) > sample_size:
+            fail_order = np.argsort(all_fail_error)[::-1]
+            selected_fail_positions = fail_order[:sample_size]
+            selected_idx_fail = idx_fail[selected_fail_positions]
+            fail_weights = all_fail_error[selected_fail_positions]
+        else:
+            selected_idx_fail = idx_fail
+            fail_weights = all_fail_error
+    else:
+        selected_idx_fail = np.array([], dtype=int)
+        fail_weights = np.array([], dtype=float)
+
+    if len(idx_pass) > 0:
+        if len(idx_pass) > sample_size:
+            pass_order = np.argsort(all_pass_correct)[::-1]
+            selected_pass_positions = pass_order[:sample_size]
+            selected_idx_pass = idx_pass[selected_pass_positions]
+            pass_weights = all_pass_correct[selected_pass_positions]
+        else:
+            selected_idx_pass = idx_pass
+            pass_weights = all_pass_correct
+    else:
+        selected_idx_pass = np.array([], dtype=int)
+        pass_weights = np.array([], dtype=float)
+
+    return selected_idx_pass, selected_idx_fail, pass_weights, fail_weights
+
+
+# GL 方法：changed/unchanged 的损失梯度比值
 def localise_by_gradient(
     X, y,
     indices_to_chgd,
@@ -1236,6 +1613,7 @@ def localise_by_gradient(
     return sorted_costs_and_keys
 
 
+# 随机定位（对照基线）
 def localise_by_random_selection(number_of_place_to_fix, target_weights):
     """
     randomly select places to fix
@@ -1266,6 +1644,7 @@ def localise_by_random_selection(number_of_place_to_fix, target_weights):
 
 # --- SBFL-style localisers (added) ---
 
+# 缓存并获取指定层的输出
 def _get_layer_output(model, layer_idx, X):
     from tensorflow.keras.models import Model
     if not hasattr(_get_layer_output, "_cache"):
@@ -1276,43 +1655,46 @@ def _get_layer_output(model, layer_idx, X):
     return cache[layer_idx].predict(X)
 
 
-def _coverage_per_unit(model, layer_idx, X, sample_weights, activation_threshold=0.1):
+# 计算层级激活覆盖（按样本权重）
+def _coverage_per_unit(
+    model, layer_idx, X, sample_weights, activation_threshold=0.1, normalise_sample_weights=True):
     """
-    Return weighted coverage counts per output unit/channel (EF/EP numerator).
-    For Dense: shape (out_units,) based on per-sample activation >= threshold.
-    For Conv2D: shape (out_channels,) using per-sample max over spatial dims.
+    Return coverage per output unit/channel for a given layer, weighted by sample_weights.
+    For Dense: shape (out_units,)
+    For Conv2D: shape (out_channels,)
     """
     if X is None or len(X) == 0:
         return None
-
     out = _get_layer_output(model, layer_idx, X)
     act = np.abs(out)
-    lname = type(model.layers[layer_idx]).__name__
+    # reduce spatial dims for conv
+    layer = model.layers[layer_idx]
+    lname = type(layer).__name__
     if model_util.is_FC(lname):
-        if act.ndim > 2:
-            act = act.reshape(act.shape[0], -1)
-        covered = (act >= activation_threshold).astype(float)  # (N, out_units)
+        # (num_samples, out_units)
+        act_unit = act
     elif model_util.is_C2D(lname):
-        # assume channels_last; reduce spatial dims per-sample
-        if act.ndim != 4:
-            return None
-        act_unit = np.max(act, axis=(1, 2))  # (N, out_channels)
-        covered = (act_unit >= activation_threshold).astype(float)
+        data_format = getattr(layer, "data_format", "channels_last")
+        if data_format == "channels_first":
+            act_unit = np.max(act, axis=(2, 3))  # (num_samples, out_channels)
+        else:
+            act_unit = np.max(act, axis=(1, 2))  # (num_samples, out_channels)
     else:
         return None
-
-    weights = None
-    if sample_weights is not None:
-        weights = np.clip(np.asarray(sample_weights, dtype=float).reshape(-1), 0.0, None)
-        if weights.shape[0] != covered.shape[0]:
-            return None
+    max_abs = np.max(act_unit) if act_unit.size else 0.0
+    if max_abs > 0:
+        act_unit = act_unit / max_abs
+    cov_unit = (act_unit >= activation_threshold).astype(float)
+    if normalise_sample_weights:
+        weights = _normalise_sample_weights(cov_unit.shape[0], sample_weights)
     else:
-        weights = np.ones(covered.shape[0], dtype=float)
+        weights = _clean_sample_weights(cov_unit.shape[0], sample_weights)
+    if weights is None:
+        return np.mean(cov_unit, axis=0)
+    return np.tensordot(weights, cov_unit, axes=([0], [0]))
 
-    # weighted coverage per unit: sum_i w_i * covered_i,u
-    return np.tensordot(weights, covered, axes=([0], [0]))
 
-
+# 基于覆盖的可疑度计算（Ochiai 形式）
 def _suspicious_from_cov(fail_cov, pass_cov, target_shape, eps=1e-12):
     fail_vals = np.repeat(fail_cov, int(np.prod(target_shape[:-1]))) if len(target_shape) > 2 else fail_cov
     pass_vals = np.repeat(pass_cov, int(np.prod(target_shape[:-1]))) if len(target_shape) > 2 else pass_cov
@@ -1321,45 +1703,33 @@ def _suspicious_from_cov(fail_cov, pass_cov, target_shape, eps=1e-12):
     return sus
 
 
+# 把覆盖可疑度展开到权重索引上
 def _build_results_from_cov(layer_idx, lname, t_w, fail_cov, pass_cov, eps=1e-12):
-    """
-    Map unit-level fail/pass coverage (EF/EP) to weight-level suspiciousness using Tarantula.
-    fail_cov/pass_cov: shape (out_units or out_channels,)
-    """
     costs_and_keys = []
-    fail_cov = np.clip(np.asarray(fail_cov, dtype=float).reshape(-1), 0.0, None)
-    pass_cov = np.clip(np.asarray(pass_cov, dtype=float).reshape(-1), 0.0, None)
-    ef_tot = float(np.sum(fail_cov)) + eps
-    ep_tot = float(np.sum(pass_cov)) + eps
-    fail_rate = fail_cov / ef_tot
-    pass_rate = pass_cov / ep_tot
-    sus_per_unit = fail_rate / (fail_rate + pass_rate + eps)
-
+    indices_to_nodes = []
     if model_util.is_FC(lname):
         out_dim = t_w.shape[-1]
         in_dim = t_w.shape[0]
-        if len(sus_per_unit) != out_dim:
-            sus_per_unit = np.resize(sus_per_unit, out_dim)
-        # replicate unit score across its incoming weights (column)
-        scores = np.repeat(sus_per_unit, in_dim).reshape(out_dim, in_dim).T.flatten()
+        fail_vals = np.repeat(fail_cov, in_dim).reshape(out_dim, in_dim).T.flatten()
+        pass_vals = np.repeat(pass_cov, in_dim).reshape(out_dim, in_dim).T.flatten()
         target_shape = t_w.shape
-        for i, sus in enumerate(scores):
-            costs_and_keys.append(([layer_idx, i], sus))
     elif model_util.is_C2D(lname):
         out_dim = t_w.shape[-1]
         repeat_size = int(np.prod(t_w.shape[:-1]))
-        if len(sus_per_unit) != out_dim:
-            sus_per_unit = np.resize(sus_per_unit, out_dim)
-        scores = np.repeat(sus_per_unit, repeat_size)
+        fail_vals = np.repeat(fail_cov, repeat_size)
+        pass_vals = np.repeat(pass_cov, repeat_size)
         target_shape = t_w.shape
-        for i, sus in enumerate(scores):
-            costs_and_keys.append(([layer_idx, i], sus))
     else:
         return costs_and_keys
-
+    total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
+    suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
+    for i, sus in enumerate(suspiciousness):
+        costs_and_keys.append(([layer_idx, i], sus))
+        indices_to_nodes.append([layer_idx, np.unravel_index(i, target_shape)])
     return costs_and_keys
 
 
+# 从 cost 结构中提取 FI 向量
 def _extract_costs(entry):
     costs = entry.get("costs", None)
     if costs is None:
@@ -1371,6 +1741,7 @@ def _extract_costs(entry):
     return arr.reshape(-1)
 
 
+# 从 cost 列表中提取 FI 向量列表
 def _extract_costs_list(entry_list):
     res = []
     for c in entry_list:
@@ -1382,73 +1753,415 @@ def _extract_costs_list(entry_list):
     return res
 
 
-def _minmax_normalise_costs(costs_and_keys):
+def _ensure_probabilities(predictions, eps=1e-7):
     """
-    Min-max normalise a list of (key, cost) pairs to [0,1] without changing ordering ties.
+    将模型输出统一转换成“概率”形式（用于后续 confidence 计算）。
+    处理逻辑：
+    - 已经是概率（范围在 [0,1] 且每行求和≈1）时，直接返回。
+    - 否则视为 logits：二分类用 sigmoid，多分类用 softmax。
+    - 兼容形状：(N, 1, C) / (N,) / (N,1) / (N,C)。
     """
-    if not costs_and_keys:
-        return costs_and_keys
-    vals = np.asarray([c for _, c in costs_and_keys], dtype=float)
-    if not np.isfinite(vals).all():
-        return costs_and_keys
-    vmin, vmax = float(vals.min()), float(vals.max())
-    if vmax - vmin < 1e-12:
-        norm_vals = np.zeros_like(vals)
-    else:
-        norm_vals = (vals - vmin) / (vmax - vmin)
-    return [(costs_and_keys[i][0], norm_vals[i]) for i in range(len(costs_and_keys))]
+    # 转成 numpy，方便统一处理
+    preds = np.asarray(predictions)
+    # 有些模型输出形状是 (N, 1, C)，这里把中间的 1 维 squeeze 掉
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    # 二分类：一维向量（N,）
+    if preds.ndim == 1:
+        # 如果数值超出 [0,1]，说明是 logits，转成 sigmoid 概率
+        if np.any(preds < 0) or np.any(preds > 1):
+            return 1.0 / (1.0 + np.exp(-preds))
+        # 否则已经是概率
+        return preds
+    # 形状 (N,1) 的二分类输出，压成一维再递归处理
+    if preds.ndim == 2 and preds.shape[1] == 1:
+        return _ensure_probabilities(preds.reshape(-1), eps)
+    # 多分类：先判断是否已是概率分布
+    if np.all(preds >= -eps) and np.all(preds <= 1.0 + eps):
+        row_sums = preds.sum(axis=1)
+        if np.allclose(row_sums, 1.0, atol=1e-3):
+            return preds
+    # 若不是概率，则视为 logits，做数值稳定的 softmax
+    maxes = np.max(preds, axis=1, keepdims=True)  # 减最大值避免溢出
+    exp = np.exp(preds - maxes)
+    return exp / np.sum(exp, axis=1, keepdims=True)
 
 
-def _boost_fi(fail_vals, pass_vals, alpha=10.0, beta=0.5, eps=1e-12, vmin=None, vmax=None):
-    """Boost FI: global min-max -> power -> scale to lift exec signal."""
-    if vmin is None or vmax is None:
-        stacked = np.concatenate([fail_vals, pass_vals]) if pass_vals is not None else fail_vals
-        if stacked.size == 0 or not np.isfinite(stacked).all():
-            return fail_vals, pass_vals
-        vmin = float(stacked.min())
-        vmax = float(stacked.max())
-    if vmax - vmin < eps:
-        norm_fail = np.zeros_like(fail_vals)
-        norm_pass = np.zeros_like(pass_vals) if pass_vals is not None else pass_vals
-    else:
-        norm_fail = (fail_vals - vmin) / (vmax - vmin)
-        norm_pass = (pass_vals - vmin) / (vmax - vmin) if pass_vals is not None else pass_vals
-    norm_fail = np.clip(norm_fail, a_min=0.0, a_max=None)
-    boosted_fail = (norm_fail + eps) ** beta * alpha
-    boosted_pass = None
-    if norm_pass is not None:
-        norm_pass = np.clip(norm_pass, a_min=0.0, a_max=None)
-        boosted_pass = (norm_pass + eps) ** beta * alpha
-    return boosted_fail, boosted_pass
+def _temperature_scale_probs(probs, temperature=1.0, eps=1e-7):
+    """
+    Apply temperature scaling to probabilities.
+    For binary: scale in logit space; for multi-class: softmax with temperature via log-prob.
+    """
+    if temperature is None or temperature == 1.0:
+        return probs
+    p = np.asarray(probs, dtype=float)
+    p = np.clip(p, eps, 1.0 - eps)
+    if p.ndim == 1:
+        logit = np.log(p) - np.log(1.0 - p)
+        return 1.0 / (1.0 + np.exp(-logit / temperature))
+    if p.ndim == 2 and p.shape[1] == 1:
+        return _temperature_scale_probs(p.reshape(-1), temperature, eps).reshape(-1, 1)
+    logp = np.log(p)
+    scaled = np.exp(logp / temperature)
+    return scaled / np.sum(scaled, axis=1, keepdims=True)
 
 
+def _margin_weights(probs, true_labels, pred_labels, gamma=1.0):
+    """
+    Compute per-sample margin weights from probabilities.
+    - pass: p_true - p_top2
+    - fail: p_top1 - p_true
+    """
+    p = np.asarray(probs, dtype=float)
+    if p.ndim == 1:
+        p = np.stack([1.0 - p, p], axis=1)
+    top2 = np.partition(p, -2, axis=1)[:, -2]
+    idx = np.arange(len(pred_labels))
+    p_true = p[idx, true_labels]
+    p_pred = p[idx, pred_labels]
+    margin = np.where(pred_labels == true_labels, p_true - top2, p_pred - p_true)
+    margin = np.clip(margin, a_min=0.0, a_max=None)
+    if gamma is not None and gamma != 1.0:
+        margin = margin ** gamma
+    return margin
+
+
+def _sparsify_topk(vals, topk_frac):
+    """
+    Keep only the top-k fraction of values (by magnitude) and zero out the rest.
+    """
+    if vals is None or topk_frac is None or topk_frac >= 1.0:
+        return vals
+    flat = np.asarray(vals, dtype=float).reshape(-1)
+    if flat.size == 0:
+        return vals
+    flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+    k = max(1, int(np.ceil(topk_frac * flat.size)))
+    thresh = np.partition(flat, -k)[-k]
+    mask = np.asarray(vals) >= thresh
+    return np.where(mask, vals, 0.0)
+
+
+def _normalise_fi_vector(vals, eps=1e-12):
+    """
+    Normalise FI scores so that the total magnitude sums to 1, avoiding division by zero.
+    """
+    if vals is None:
+        return None
+    arr = np.asarray(vals, dtype=float)
+    if arr.size == 0:
+        return arr
+    total = np.sum(np.abs(arr))
+    if total <= eps:
+        return arr
+    return arr / total
+
+
+# SBFL 变体：FI 参与度 + 置信度结果（新版实现，覆盖上面同名函数）
 def localise_by_qexec_qres_sbfl(
     X, y, predictions, target_weights,
-    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1):
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, return_details=False):
     """
-    Quantised execution (FI-based) + quantised result (probability) SBFL (soft Tarantula).
+    Quantised execution (FI-based) + quantised result (probability) SBFL (Ochiai).
+    Confidence is used purely as a result signal; FI remains unweighted.
+    (与传统 SBFL 对齐：执行度与结果信号在外层结合，而不是在 FI 计算时加权。)
     """
-    if predictions.ndim == 1:
-        pred_labels = np.round(predictions).astype(int)
-        pred_confidence = predictions.flatten()
+    preds = np.asarray(predictions)
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    if preds.ndim == 1 or (preds.ndim == 2 and preds.shape[1] == 1):
+        probs = _ensure_probabilities(preds.reshape(-1))
+        pred_labels = (probs >= 0.5).astype(int)
+        pred_confidence = np.where(pred_labels == 1, probs, 1.0 - probs)
     else:
-        pred_labels = np.argmax(predictions, axis=1)
-        pred_confidence = predictions[np.arange(len(pred_labels)), pred_labels]
+        probs = _ensure_probabilities(preds)
+        pred_labels = np.argmax(probs, axis=1)
+        pred_confidence = probs[np.arange(len(pred_labels)), pred_labels]
     if y.ndim > 1:
         true_labels = np.argmax(y, axis=1)
     else:
         true_labels = y
 
     correct_mask = pred_labels == true_labels
-    # A: correct samples get a smaller penalty when confidence is high; wrong samples get a larger penalty.
-    success_scores = np.where(correct_mask, 1.0 - pred_confidence, 0.0)
-    failure_scores = np.where(~correct_mask, pred_confidence, 0.0)
-
-    idx_pass = np.where(success_scores > 0)[0]
-    idx_fail = np.where(failure_scores > 0)[0]
+    idx_pass = np.where(correct_mask)[0]
+    idx_fail = np.where(~correct_mask)[0]
     sample_size = min(len(idx_pass), len(idx_fail))
     if sample_size > 0:
-        rng = np.random.default_rng()
+        pass_conf = pred_confidence[idx_pass]
+        fail_conf = pred_confidence[idx_fail]
+        idx_pass = _select_by_confidence(idx_pass, pass_conf, sample_size, top=True)
+        idx_fail = _select_by_confidence(idx_fail, fail_conf, sample_size, top=False)
+
+    pass_conf = pred_confidence[idx_pass] if len(idx_pass) else np.array([])
+    fail_conf = pred_confidence[idx_fail] if len(idx_fail) else np.array([])
+
+    # Per-sample FI (matrix) for fail/pass to support confidence-weighted Ochiai.
+    fail_cands = compute_FI_and_GL_by_sample(
+        X, y, idx_fail, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=None,
+        use_gradient_loss=False)
+    pass_cands = compute_FI_and_GL_by_sample(
+        X, y, idx_pass, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=None,
+        use_gradient_loss=False)
+
+    fail_conf_w = np.clip(fail_conf, 0.0, 1.0)
+    pass_conf_w = np.clip(pass_conf, 0.0, 1.0)
+    fail_conf_sum = float(np.sum(fail_conf_w)) if len(fail_conf_w) else 0.0
+    fail_conf_sum = fail_conf_sum if fail_conf_sum > 0 else eps
+
+    costs_and_keys = []
+    details = []  # optional: keep raw fail/pass FI (after confidence scaling)
+
+    def _sum_weighted(conf_w, mat, n_params):
+        if mat.size == 0:
+            return np.zeros(n_params)
+        if mat.ndim == 1:
+            vec = mat.reshape(-1)
+            if vec.size != n_params:
+                vec = vec[:n_params]
+            return _normalise_fi_values(vec)
+        if mat.shape[0] != len(conf_w):
+            min_len = min(mat.shape[0], len(conf_w))
+            mat = mat[:min_len]
+            conf_w = conf_w[:min_len]
+        mat = _normalise_fi_values(mat)
+        vec = conf_w @ mat
+        if vec.size != n_params:
+            vec = vec[:n_params]
+        return vec
+
+    for idx_to_tl, vs in target_weights.items():
+        t_w, lname = vs
+        fail_entry = fail_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(fail_cands, dict) else {}
+        pass_entry = pass_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(pass_cands, dict) else {}
+
+        if not model_util.is_LSTM(lname):
+            target_shape = fail_entry.get("shape") or pass_entry.get("shape")
+            if target_shape is None:
+                target_shape = np.asarray(t_w).shape
+            n_params = int(np.prod(target_shape))
+            fail_mat = np.asarray(fail_entry.get("costs", []))
+            pass_mat = np.asarray(pass_entry.get("costs", []))
+
+            fail_sum = _sum_weighted(fail_conf_w, fail_mat, n_params)
+            pass_sum = _sum_weighted(pass_conf_w, pass_mat, n_params)
+
+            suspiciousness = fail_sum / np.sqrt(fail_conf_sum * (fail_sum + pass_sum) + eps)
+            for i, sus in enumerate(suspiciousness):
+                costs_and_keys.append(([idx_to_tl, i], sus))
+                if return_details:
+                    details.append([idx_to_tl, i, sus, fail_sum[i], pass_sum[i]])
+        else:
+            # Fallback for LSTM: use aggregated costs when per-sample matrices are unavailable.
+            shapes = fail_entry.get("shape") or pass_entry.get("shape") or [w.shape for w in t_w]
+            fail_list = fail_entry.get("costs", [])
+            pass_list = pass_entry.get("costs", [])
+            fail_vals_list = _extract_costs_list(fail_list) if fail_list else []
+            pass_vals_list = _extract_costs_list(pass_list) if pass_list else []
+            pass_conf_sum = float(np.sum(pass_conf_w)) if len(pass_conf_w) else 0.0
+            for idx_to_w, shape in enumerate(shapes):
+                fail_vals = fail_vals_list[idx_to_w] if idx_to_w < len(fail_vals_list) else np.zeros(np.prod(shape))
+                pass_vals = pass_vals_list[idx_to_w] if idx_to_w < len(pass_vals_list) else np.zeros(np.prod(shape))
+                fail_vals = _normalise_fi_values(fail_vals)
+                pass_vals = _normalise_fi_values(pass_vals)
+                fail_sum = fail_vals * fail_conf_sum
+                pass_sum = pass_vals * pass_conf_sum
+                suspiciousness = fail_sum / np.sqrt(fail_conf_sum * (fail_sum + pass_sum) + eps)
+                for local_i, sus in enumerate(suspiciousness):
+                    costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
+                    if return_details:
+                        details.append([(idx_to_tl, idx_to_w), local_i, sus, fail_sum[local_i], pass_sum[local_i]])
+
+    sorted_costs_and_keys = sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
+    if return_details:
+        import pandas as pd
+        det_df = pd.DataFrame(details, columns=["layer", "flat_idx", "suspiciousness", "fail_fi", "pass_fi"])
+        return sorted_costs_and_keys, det_df
+    return sorted_costs_and_keys
+
+
+def localise_by_qexec_qres_error_extent_sbfl(
+    X, y, predictions, target_weights,
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, return_details=False):
+    """
+    Quantised execution + quantised result with error extent sampling and weighting.
+
+    Sampling: Based on error extent
+    - Fail: select samples with highest error degree (most confidently wrong)
+    - Pass: select samples with highest correctness (most confidently right)
+
+    Weighting: Error extent
+    - Error degree = predicted_class_prob - true_class_prob
+    """
+    preds = np.asarray(predictions)
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    if preds.ndim == 1 or (preds.ndim == 2 and preds.shape[1] == 1):
+        probs = _ensure_probabilities(preds.reshape(-1))
+        pred_labels = (probs >= 0.5).astype(int)
+    else:
+        probs = _ensure_probabilities(preds)
+        pred_labels = np.argmax(probs, axis=1)
+    if y.ndim > 1:
+        true_labels = np.argmax(y, axis=1)
+    else:
+        true_labels = y
+
+    correct_mask = pred_labels == true_labels
+    idx_pass = np.where(correct_mask)[0]
+    idx_fail = np.where(~correct_mask)[0]
+
+    # Use error-extent sampling
+    idx_pass, idx_fail, pass_weights, fail_weights = sample_for_extent_sbfl(
+        idx_pass, idx_fail,
+        probs, pred_labels, true_labels,
+        sample_size=None)
+
+    if len(fail_weights) > 0:
+        print(
+            f"[qres_error_extent] Fail: n={len(idx_fail)}, "
+            f"error_degree: min={fail_weights.min():.4f}, max={fail_weights.max():.4f}, "
+            f"mean={fail_weights.mean():.4f}, std={fail_weights.std():.4f}"
+        )
+    if len(pass_weights) > 0:
+        print(
+            f"[qres_error_extent] Pass: n={len(idx_pass)}, "
+            f"correctness: min={pass_weights.min():.4f}, max={pass_weights.max():.4f}, "
+            f"mean={pass_weights.mean():.4f}"
+        )
+
+    # Per-sample FI (matrix) for fail/pass to support extent-weighted Ochiai.
+    fail_cands = compute_FI_and_GL_by_sample(
+        X, y, idx_fail, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=None,
+        use_gradient_loss=False)
+    pass_cands = compute_FI_and_GL_by_sample(
+        X, y, idx_pass, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=None,
+        use_gradient_loss=False)
+
+    fail_error_w = fail_weights
+    pass_correct_w = pass_weights
+    fail_error_sum = float(np.sum(fail_error_w)) if len(fail_error_w) else 0.0
+    fail_error_sum = fail_error_sum if fail_error_sum > 0 else eps
+
+    costs_and_keys = []
+    details = []
+
+    def _sum_weighted(conf_w, mat, n_params):
+        if mat.size == 0:
+            return np.zeros(n_params)
+        if mat.ndim == 1:
+            vec = mat.reshape(-1)
+            if vec.size != n_params:
+                vec = vec[:n_params]
+            return _normalise_fi_values(vec)
+        if mat.shape[0] != len(conf_w):
+            min_len = min(mat.shape[0], len(conf_w))
+            mat = mat[:min_len]
+            conf_w = conf_w[:min_len]
+        mat = _normalise_fi_values(mat)
+        vec = conf_w @ mat
+        if vec.size != n_params:
+            vec = vec[:n_params]
+        return vec
+
+    for idx_to_tl, vs in target_weights.items():
+        t_w, lname = vs
+        fail_entry = fail_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(fail_cands, dict) else {}
+        pass_entry = pass_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(pass_cands, dict) else {}
+
+        if not model_util.is_LSTM(lname):
+            target_shape = fail_entry.get("shape") or pass_entry.get("shape")
+            if target_shape is None:
+                target_shape = np.asarray(t_w).shape
+            n_params = int(np.prod(target_shape))
+            fail_mat = np.asarray(fail_entry.get("costs", []))
+            pass_mat = np.asarray(pass_entry.get("costs", []))
+
+            fail_sum = _sum_weighted(fail_error_w, fail_mat, n_params)
+            pass_sum = _sum_weighted(pass_correct_w, pass_mat, n_params)
+
+            suspiciousness = fail_sum / np.sqrt(fail_error_sum * (fail_sum + pass_sum) + eps)
+            for i, sus in enumerate(suspiciousness):
+                costs_and_keys.append(([idx_to_tl, i], sus))
+                if return_details:
+                    details.append([idx_to_tl, i, sus, fail_sum[i], pass_sum[i]])
+        else:
+            shapes = fail_entry.get("shape") or pass_entry.get("shape") or [w.shape for w in t_w]
+            fail_list = fail_entry.get("costs", [])
+            pass_list = pass_entry.get("costs", [])
+            fail_vals_list = _extract_costs_list(fail_list) if fail_list else []
+            pass_vals_list = _extract_costs_list(pass_list) if pass_list else []
+            pass_correct_sum = float(np.sum(pass_correct_w)) if len(pass_correct_w) else 0.0
+            for idx_to_w, shape in enumerate(shapes):
+                fail_vals = fail_vals_list[idx_to_w] if idx_to_w < len(fail_vals_list) else np.zeros(np.prod(shape))
+                pass_vals = pass_vals_list[idx_to_w] if idx_to_w < len(pass_vals_list) else np.zeros(np.prod(shape))
+                fail_vals = _normalise_fi_values(fail_vals)
+                pass_vals = _normalise_fi_values(pass_vals)
+                fail_sum = fail_vals * fail_error_sum
+                pass_sum = pass_vals * pass_correct_sum
+                suspiciousness = fail_sum / np.sqrt(fail_error_sum * (fail_sum + pass_sum) + eps)
+                for local_i, sus in enumerate(suspiciousness):
+                    costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
+                    if return_details:
+                        details.append([(idx_to_tl, idx_to_w), local_i, sus, fail_sum[local_i], pass_sum[local_i]])
+
+    sorted_costs_and_keys = sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
+    if return_details:
+        import pandas as pd
+        det_df = pd.DataFrame(details, columns=["layer", "flat_idx", "suspiciousness", "fail_fi", "pass_fi"])
+        return sorted_costs_and_keys, det_df
+    return sorted_costs_and_keys
+
+
+# SBFL 变体：qexec + qres（B+C 改进版）
+def localise_by_qexec_qres_bc_sbfl(
+    X, y, predictions, target_weights,
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, temperature=5.0, margin_gamma=1.0, fi_topk_frac=0.1):
+    """
+    Quantised execution (FI-based) + margin-weighted qres with temperature scaling (B)
+    and FI top-k sparsification (C).
+    """
+    preds = np.asarray(predictions)
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    if preds.ndim == 1 or (preds.ndim == 2 and preds.shape[1] == 1):
+        probs_raw = _ensure_probabilities(preds.reshape(-1))
+        pred_labels = (probs_raw >= 0.5).astype(int)
+    else:
+        probs_raw = _ensure_probabilities(preds)
+        pred_labels = np.argmax(probs_raw, axis=1)
+    if y.ndim > 1:
+        true_labels = np.argmax(y, axis=1)
+    else:
+        true_labels = y
+
+    probs = _temperature_scale_probs(probs_raw, temperature=temperature)
+    margin_scores = _margin_weights(probs, true_labels, pred_labels, gamma=margin_gamma)
+
+    correct_mask = pred_labels == true_labels
+    idx_pass = np.where(correct_mask)[0]
+    idx_fail = np.where(~correct_mask)[0]
+    sample_size = min(len(idx_pass), len(idx_fail))
+    if sample_size > 0:
+        rng = np.random.default_rng(sample_seed)
         idx_pass = rng.choice(idx_pass, sample_size, replace=False)
         idx_fail = rng.choice(idx_fail, sample_size, replace=False)
 
@@ -1457,14 +2170,14 @@ def localise_by_qexec_qres_sbfl(
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
-        sample_weights=failure_scores[idx_fail] if len(idx_fail) else None,
+        sample_weights=margin_scores[idx_fail] if len(idx_fail) else None,
         use_gradient_loss=False)
     pass_cands = compute_FI_and_GL(
         X, y, idx_pass, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
-        sample_weights=success_scores[idx_pass] if len(idx_pass) else None,
+        sample_weights=margin_scores[idx_pass] if len(idx_pass) else None,
         use_gradient_loss=False)
 
     costs_and_keys = []
@@ -1486,16 +2199,12 @@ def localise_by_qexec_qres_sbfl(
                     fail_vals = np.zeros_like(pass_vals)
                 elif pass_vals.shape[0] == 0:
                     pass_vals = np.zeros_like(fail_vals)
-
-            # soft Tarantula: compare normalised fail/pass participation (per-weight EF/EP with global totals).
-            fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
-            pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
-
-            ef_tot = float(np.sum(fail_vals)) + eps
-            ep_tot = float(np.sum(pass_vals)) + eps
-            fail_rate = fail_vals / ef_tot
-            pass_rate = pass_vals / ep_tot
-            suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
+            fail_vals = _normalise_fi_values(fail_vals)
+            pass_vals = _normalise_fi_values(pass_vals)
+            fail_vals = _sparsify_topk(fail_vals, fi_topk_frac)
+            pass_vals = _sparsify_topk(pass_vals, fi_topk_frac)
+            total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
+            suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
             for i, sus in enumerate(suspiciousness):
                 costs_and_keys.append(([idx_to_tl, i], sus))
         else:
@@ -1511,145 +2220,38 @@ def localise_by_qexec_qres_sbfl(
                     fail_vals = np.zeros(np.prod(shape))
                 if pass_vals.shape[0] == 0:
                     pass_vals = np.zeros(np.prod(shape))
-
-                fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
-                pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
-
-                ef_tot = float(np.sum(fail_vals)) + eps
-                ep_tot = float(np.sum(pass_vals)) + eps
-
-                fail_rate = fail_vals / ef_tot
-                pass_rate = pass_vals / ep_tot
-                suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
+                fail_vals = _normalise_fi_values(fail_vals)
+                pass_vals = _normalise_fi_values(pass_vals)
+                fail_vals = _sparsify_topk(fail_vals, fi_topk_frac)
+                pass_vals = _sparsify_topk(pass_vals, fi_topk_frac)
+                total_fail_weight = float(np.sum(fail_vals)) if np.sum(fail_vals) > 0 else eps
+                suspiciousness = fail_vals / np.sqrt(total_fail_weight * (fail_vals + pass_vals) + eps)
                 for local_i, sus in enumerate(suspiciousness):
                     costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
 
     return sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
 
 
-def localise_by_qexec_qres_multiplicative(
-    X, y, predictions, target_weights,
-    path_to_keras_model=None,
-    is_multi_label=True,
-    lam=1.0,
-    pass_weight_mode="one_minus_conf",
-    balance=True,
-    eps=1e-12):
-    """
-    Multiplicative qexec-qres localisation.
-
-    FailSignal(w) = Σ_{i in fail} [conf_i * exec_i(w)]   (via sample_weights + sum)
-    PassSignal(w) = Σ_{i in pass} [pass_w_i * exec_i(w)]
-    score(w) = FailSignal(w) - lam * PassSignal(w)
-    """
-    if predictions.ndim == 1:
-        pred_labels = np.round(predictions).astype(int)
-        pred_conf = predictions.flatten()
-    else:
-        pred_labels = np.argmax(predictions, axis=1)
-        pred_conf = predictions[np.arange(len(pred_labels)), pred_labels]
-
-    true_labels = np.argmax(y, axis=1) if (y.ndim > 1) else y
-    correct_mask = pred_labels == true_labels
-
-    idx_pass = np.where(correct_mask)[0]
-    idx_fail = np.where(~correct_mask)[0]
-
-    if len(idx_fail) == 0:
-        return []
-
-    if balance and len(idx_pass) > 0:
-        sample_size = min(len(idx_pass), len(idx_fail))
-        if sample_size > 0:
-            rng = np.random.default_rng()
-            idx_pass = rng.choice(idx_pass, sample_size, replace=False)
-            idx_fail = rng.choice(idx_fail, sample_size, replace=False)
-
-    fail_weights = pred_conf[idx_fail]
-    pass_weights = None
-    if len(idx_pass) > 0 and pass_weight_mode != "none":
-        if pass_weight_mode == "one_minus_conf":
-            pass_weights = 1.0 - pred_conf[idx_pass]
-        elif pass_weight_mode == "conf":
-            pass_weights = pred_conf[idx_pass]
-        else:
-            raise ValueError(f"Unsupported pass_weight_mode: {pass_weight_mode}")
-
-    fail_cands = compute_FI_and_GL(
-        X, y, idx_fail, target_weights,
-        is_multi_label=is_multi_label,
-        path_to_keras_model=path_to_keras_model,
-        federated=False,
-        sample_weights=fail_weights,
-        use_gradient_loss=False)
-
-    pass_cands = None
-    if pass_weights is not None and lam != 0.0:
-        pass_cands = compute_FI_and_GL(
-            X, y, idx_pass, target_weights,
-            is_multi_label=is_multi_label,
-            path_to_keras_model=path_to_keras_model,
-            federated=False,
-            sample_weights=pass_weights,
-            use_gradient_loss=False)
-
-    scores_and_keys = []
-    for layer_idx, vs in target_weights.items():
-        t_w, lname = vs
-        fail_entry = fail_cands.get(layer_idx, {"costs": [], "shape": []}) if isinstance(fail_cands, dict) else {}
-        pass_entry = pass_cands.get(layer_idx, {"costs": [], "shape": []}) if isinstance(pass_cands, dict) else {}
-
-        if not model_util.is_LSTM(lname):
-            target_shape = fail_entry.get("shape") or pass_entry.get("shape") or t_w.shape
-            fail_vals = _extract_costs(fail_entry)
-            pass_vals = _extract_costs(pass_entry) if pass_cands is not None and lam != 0.0 else None
-
-            if fail_vals is None or np.asarray(fail_vals).size == 0:
-                fail_vals = np.zeros(int(np.prod(target_shape)), dtype=float)
-            else:
-                fail_vals = np.asarray(fail_vals, dtype=float).reshape(-1)
-
-            if pass_vals is None:
-                pass_vals = np.zeros_like(fail_vals)
-            else:
-                pass_vals = np.asarray(pass_vals, dtype=float).reshape(-1)
-                if pass_vals.shape != fail_vals.shape:
-                    pass_vals = np.zeros_like(fail_vals)
-
-            score = fail_vals - lam * pass_vals
-            for i, s in enumerate(score):
-                scores_and_keys.append(([layer_idx, i], float(s)))
-        else:
-            shapes = fail_entry.get("shape") or pass_entry.get("shape") or [w.shape for w in t_w]
-            fail_list = fail_entry.get("costs", [])
-            pass_list = pass_entry.get("costs", []) if pass_cands is not None and lam != 0.0 else []
-            fail_vals_list = _extract_costs_list(fail_list) if fail_list else []
-            pass_vals_list = _extract_costs_list(pass_list) if pass_list else []
-
-            for idx_to_w, shape in enumerate(shapes):
-                fail_vals = fail_vals_list[idx_to_w] if idx_to_w < len(fail_vals_list) else np.zeros(np.prod(shape))
-                pass_vals = pass_vals_list[idx_to_w] if idx_to_w < len(pass_vals_list) else np.zeros(np.prod(shape))
-                if fail_vals.shape[0] == 0:
-                    fail_vals = np.zeros(np.prod(shape))
-                if pass_vals.shape[0] == 0:
-                    pass_vals = np.zeros(np.prod(shape))
-                score = fail_vals - lam * pass_vals
-                for local_i, s in enumerate(score):
-                    scores_and_keys.append(([(layer_idx, idx_to_w), local_i], float(s)))
-
-    return sorted(scores_and_keys, key=lambda v: v[1], reverse=True)
-
-
+# SBFL 变体：FI 参与度 + 二值结果（按置信度加权）
 def localise_by_qexec_bres_sbfl(
     X, y, predictions, target_weights,
-    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1):
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, return_details=False):
     """
-    Quantised execution (FI-based) + binary result (pass/fail=1) with soft Tarantula.
+    Quantised execution (FI-based) + binary result (pass/fail=1).
+    FI is unweighted; result weights are constant (1.0) for both pass/fail.
     """
-    if predictions.ndim == 1:
-        pred_labels = np.round(predictions).astype(int)
+    preds = np.asarray(predictions)
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    if preds.ndim == 1 or (preds.ndim == 2 and preds.shape[1] == 1):
+        probs = _ensure_probabilities(preds.reshape(-1))
+        pred_labels = (probs >= 0.5).astype(int)
+        pred_confidence = np.where(pred_labels == 1, probs, 1.0 - probs)
     else:
-        pred_labels = np.argmax(predictions, axis=1)
+        probs = _ensure_probabilities(preds)
+        pred_labels = np.argmax(probs, axis=1)
+        pred_confidence = probs[np.arange(len(pred_labels)), pred_labels]
     if y.ndim > 1:
         true_labels = np.argmax(y, axis=1)
     else:
@@ -1659,18 +2261,20 @@ def localise_by_qexec_bres_sbfl(
     idx_fail = np.where(~correct_mask)[0]
     sample_size = min(len(idx_pass), len(idx_fail))
     if sample_size > 0:
-        rng = np.random.default_rng()
-        idx_pass = rng.choice(idx_pass, sample_size, replace=False)
-        idx_fail = rng.choice(idx_fail, sample_size, replace=False)
+        pass_conf = pred_confidence[idx_pass]
+        fail_conf = pred_confidence[idx_fail]
+        idx_pass = _select_by_confidence(idx_pass, pass_conf, sample_size, top=True)
+        idx_fail = _select_by_confidence(idx_fail, fail_conf, sample_size, top=False)
 
-    fail_cands = compute_FI_and_GL(
+    # Per-sample FI (matrix) for fail/pass; result weights are binary (1.0 per sample).
+    fail_cands = compute_FI_and_GL_by_sample(
         X, y, idx_fail, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
         federated=False,
         sample_weights=None,
         use_gradient_loss=False)
-    pass_cands = compute_FI_and_GL(
+    pass_cands = compute_FI_and_GL_by_sample(
         X, y, idx_pass, target_weights,
         is_multi_label=is_multi_label,
         path_to_keras_model=path_to_keras_model,
@@ -1678,36 +2282,54 @@ def localise_by_qexec_bres_sbfl(
         sample_weights=None,
         use_gradient_loss=False)
 
+    fail_weights = np.ones(len(idx_fail), dtype=float)
+    pass_weights = np.ones(len(idx_pass), dtype=float)
+    fail_weight_sum = float(np.sum(fail_weights)) if len(fail_weights) else 0.0
+    fail_weight_sum = fail_weight_sum if fail_weight_sum > 0 else eps
+    pass_weight_sum = float(np.sum(pass_weights)) if len(pass_weights) else 0.0
+
     costs_and_keys = []
+    details = []
+
+    def _sum_weighted(weights, mat, n_params):
+        if mat.size == 0:
+            return np.zeros(n_params)
+        if mat.ndim == 1:
+            vec = mat.reshape(-1)
+            if vec.size != n_params:
+                vec = vec[:n_params]
+            return _normalise_fi_values(vec)
+        if mat.shape[0] != len(weights):
+            min_len = min(mat.shape[0], len(weights))
+            mat = mat[:min_len]
+            weights = weights[:min_len]
+        mat = _normalise_fi_values(mat)
+        vec = weights @ mat
+        if vec.size != n_params:
+            vec = vec[:n_params]
+        return vec
+
     for idx_to_tl, vs in target_weights.items():
         t_w, lname = vs
         fail_entry = fail_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(fail_cands, dict) else {}
         pass_entry = pass_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(pass_cands, dict) else {}
 
         if not model_util.is_LSTM(lname):
-            target_shape = fail_entry.get("shape") or pass_entry.get("shape") or t_w.shape
-            fail_vals = _extract_costs(fail_entry)
-            pass_vals = _extract_costs(pass_entry)
-            if fail_vals is None:
-                fail_vals = np.zeros(np.prod(target_shape))
-            if pass_vals is None:
-                pass_vals = np.zeros(np.prod(target_shape))
-            if fail_vals.shape != pass_vals.shape:
-                if fail_vals.shape[0] == 0:
-                    fail_vals = np.zeros_like(pass_vals)
-                elif pass_vals.shape[0] == 0:
-                    pass_vals = np.zeros_like(fail_vals)
-            fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
-            pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
+            target_shape = fail_entry.get("shape") or pass_entry.get("shape")
+            if target_shape is None:
+                target_shape = np.asarray(t_w).shape
+            n_params = int(np.prod(target_shape))
+            fail_mat = np.asarray(fail_entry.get("costs", []))
+            pass_mat = np.asarray(pass_entry.get("costs", []))
 
-            ef_tot = float(np.sum(fail_vals)) + eps
-            ep_tot = float(np.sum(pass_vals)) + eps
+            fail_sum = _sum_weighted(fail_weights, fail_mat, n_params)
+            pass_sum = _sum_weighted(pass_weights, pass_mat, n_params)
 
-            fail_rate = fail_vals / ef_tot
-            pass_rate = pass_vals / ep_tot
-            suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
+            suspiciousness = fail_sum / np.sqrt(fail_weight_sum * (fail_sum + pass_sum) + eps)
             for i, sus in enumerate(suspiciousness):
                 costs_and_keys.append(([idx_to_tl, i], sus))
+                if return_details:
+                    details.append([idx_to_tl, i, sus, fail_sum[i], pass_sum[i]])
         else:
             shapes = fail_entry.get("shape") or pass_entry.get("shape") or [w.shape for w in t_w]
             fail_list = fail_entry.get("costs", [])
@@ -1721,33 +2343,185 @@ def localise_by_qexec_bres_sbfl(
                     fail_vals = np.zeros(np.prod(shape))
                 if pass_vals.shape[0] == 0:
                     pass_vals = np.zeros(np.prod(shape))
-                fail_vals = np.clip(np.asarray(fail_vals, dtype=float).reshape(-1), 0.0, None)
-                pass_vals = np.clip(np.asarray(pass_vals, dtype=float).reshape(-1), 0.0, None)
-
-                ef_tot = float(np.sum(fail_vals)) + eps
-                ep_tot = float(np.sum(pass_vals)) + eps
-
-                fail_rate = fail_vals / ef_tot
-                pass_rate = pass_vals / ep_tot
-                suspiciousness = fail_rate / (fail_rate + pass_rate + eps)
+                fail_vals = _normalise_fi_values(fail_vals)
+                pass_vals = _normalise_fi_values(pass_vals)
+                fail_sum = fail_vals * fail_weight_sum
+                pass_sum = pass_vals * pass_weight_sum
+                suspiciousness = fail_sum / np.sqrt(fail_weight_sum * (fail_sum + pass_sum) + eps)
                 for local_i, sus in enumerate(suspiciousness):
                     costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
+                    if return_details:
+                        details.append([(idx_to_tl, idx_to_w), local_i, sus, fail_sum[local_i], pass_sum[local_i]])
 
-    return sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
+    sorted_costs_and_keys = sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
+    if return_details:
+        import pandas as pd
+        det_df = pd.DataFrame(details, columns=["layer", "flat_idx", "suspiciousness", "fail_fi", "pass_fi"])
+        return sorted_costs_and_keys, det_df
+    return sorted_costs_and_keys
 
 
-def localise_by_bexec_qres_guider(
+def localise_by_qexec_bres_error_extent_sbfl(
     X, y, predictions, target_weights,
-    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1):
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, return_details=False):
+    """
+    Quantised execution + binary result with error extent sampling.
+
+    Sampling: Based on error extent
+    - Fail: select samples with highest error degree (most confidently wrong)
+    - Pass: select samples with highest correctness (most confidently right)
+    """
+    preds = np.asarray(predictions)
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    if preds.ndim == 1 or (preds.ndim == 2 and preds.shape[1] == 1):
+        probs = _ensure_probabilities(preds.reshape(-1))
+        pred_labels = (probs >= 0.5).astype(int)
+    else:
+        probs = _ensure_probabilities(preds)
+        pred_labels = np.argmax(probs, axis=1)
+    if y.ndim > 1:
+        true_labels = np.argmax(y, axis=1)
+    else:
+        true_labels = y
+    correct_mask = pred_labels == true_labels
+    idx_pass = np.where(correct_mask)[0]
+    idx_fail = np.where(~correct_mask)[0]
+
+    # Use error-extent sampling
+    idx_pass, idx_fail, pass_extent, fail_extent = sample_for_extent_sbfl(
+        idx_pass, idx_fail,
+        probs, pred_labels, true_labels,
+        sample_size=None)
+
+    if len(fail_extent) > 0:
+        print(
+            f"[bres_error_extent] Fail: n={len(idx_fail)}, "
+            f"error_degree: min={fail_extent.min():.4f}, max={fail_extent.max():.4f}, "
+            f"mean={fail_extent.mean():.4f}, std={fail_extent.std():.4f}"
+        )
+    if len(pass_extent) > 0:
+        print(
+            f"[bres_error_extent] Pass: n={len(idx_pass)}, "
+            f"correctness: min={pass_extent.min():.4f}, max={pass_extent.max():.4f}, "
+            f"mean={pass_extent.mean():.4f}"
+        )
+
+    # Per-sample FI (matrix) for fail/pass; result weights are binary (1.0 per sample).
+    fail_cands = compute_FI_and_GL_by_sample(
+        X, y, idx_fail, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=None,
+        use_gradient_loss=False)
+    pass_cands = compute_FI_and_GL_by_sample(
+        X, y, idx_pass, target_weights,
+        is_multi_label=is_multi_label,
+        path_to_keras_model=path_to_keras_model,
+        federated=False,
+        sample_weights=None,
+        use_gradient_loss=False)
+
+    fail_weights = np.ones(len(idx_fail), dtype=float)
+    pass_weights = np.ones(len(idx_pass), dtype=float)
+    fail_weight_sum = float(np.sum(fail_weights)) if len(fail_weights) else 0.0
+    fail_weight_sum = fail_weight_sum if fail_weight_sum > 0 else eps
+    pass_weight_sum = float(np.sum(pass_weights)) if len(pass_weights) else 0.0
+
+    costs_and_keys = []
+    details = []
+
+    def _sum_weighted(weights, mat, n_params):
+        if mat.size == 0:
+            return np.zeros(n_params)
+        if mat.ndim == 1:
+            vec = mat.reshape(-1)
+            if vec.size != n_params:
+                vec = vec[:n_params]
+            return _normalise_fi_values(vec)
+        if mat.shape[0] != len(weights):
+            min_len = min(mat.shape[0], len(weights))
+            mat = mat[:min_len]
+            weights = weights[:min_len]
+        mat = _normalise_fi_values(mat)
+        vec = weights @ mat
+        if vec.size != n_params:
+            vec = vec[:n_params]
+        return vec
+
+    for idx_to_tl, vs in target_weights.items():
+        t_w, lname = vs
+        fail_entry = fail_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(fail_cands, dict) else {}
+        pass_entry = pass_cands.get(idx_to_tl, {"costs": [], "shape": []}) if isinstance(pass_cands, dict) else {}
+
+        if not model_util.is_LSTM(lname):
+            target_shape = fail_entry.get("shape") or pass_entry.get("shape")
+            if target_shape is None:
+                target_shape = np.asarray(t_w).shape
+            n_params = int(np.prod(target_shape))
+            fail_mat = np.asarray(fail_entry.get("costs", []))
+            pass_mat = np.asarray(pass_entry.get("costs", []))
+
+            fail_sum = _sum_weighted(fail_weights, fail_mat, n_params)
+            pass_sum = _sum_weighted(pass_weights, pass_mat, n_params)
+
+            suspiciousness = fail_sum / np.sqrt(fail_weight_sum * (fail_sum + pass_sum) + eps)
+            for i, sus in enumerate(suspiciousness):
+                costs_and_keys.append(([idx_to_tl, i], sus))
+                if return_details:
+                    details.append([idx_to_tl, i, sus, fail_sum[i], pass_sum[i]])
+        else:
+            shapes = fail_entry.get("shape") or pass_entry.get("shape") or [w.shape for w in t_w]
+            fail_list = fail_entry.get("costs", [])
+            pass_list = pass_entry.get("costs", [])
+            fail_vals_list = _extract_costs_list(fail_list) if fail_list else []
+            pass_vals_list = _extract_costs_list(pass_list) if pass_list else []
+            for idx_to_w, shape in enumerate(shapes):
+                fail_vals = fail_vals_list[idx_to_w] if idx_to_w < len(fail_vals_list) else np.zeros(np.prod(shape))
+                pass_vals = pass_vals_list[idx_to_w] if idx_to_w < len(pass_vals_list) else np.zeros(np.prod(shape))
+                if fail_vals.shape[0] == 0:
+                    fail_vals = np.zeros(np.prod(shape))
+                if pass_vals.shape[0] == 0:
+                    pass_vals = np.zeros(np.prod(shape))
+                fail_vals = _normalise_fi_values(fail_vals)
+                pass_vals = _normalise_fi_values(pass_vals)
+                fail_sum = fail_vals * fail_weight_sum
+                pass_sum = pass_vals * pass_weight_sum
+                suspiciousness = fail_sum / np.sqrt(fail_weight_sum * (fail_sum + pass_sum) + eps)
+                for local_i, sus in enumerate(suspiciousness):
+                    costs_and_keys.append(([(idx_to_tl, idx_to_w), local_i], sus))
+                    if return_details:
+                        details.append([(idx_to_tl, idx_to_w), local_i, sus, fail_sum[local_i], pass_sum[local_i]])
+
+    sorted_costs_and_keys = sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
+    if return_details:
+        import pandas as pd
+        det_df = pd.DataFrame(details, columns=["layer", "flat_idx", "suspiciousness", "fail_fi", "pass_fi"])
+        return sorted_costs_and_keys, det_df
+    return sorted_costs_and_keys
+
+
+# SBFL 变体：二值执行覆盖 + 置信度结果
+def localise_by_bexec_qres_sbfl(
+    X, y, predictions, target_weights,
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, normalise_sample_weights=True):
     """
     Binary execution (activation coverage) + quantised result (probability).
     """
-    if predictions.ndim == 1:
-        pred_labels = np.round(predictions).astype(int)
-        pred_confidence = predictions.flatten()
+    preds = np.asarray(predictions)
+    if preds.ndim == 3 and preds.shape[1] == 1:
+        preds = preds[:, 0, :]
+    if preds.ndim == 1 or (preds.ndim == 2 and preds.shape[1] == 1):
+        probs = _ensure_probabilities(preds.reshape(-1))
+        pred_labels = (probs >= 0.5).astype(int)
+        pred_confidence = np.where(pred_labels == 1, probs, 1.0 - probs)
     else:
-        pred_labels = np.argmax(predictions, axis=1)
-        pred_confidence = predictions[np.arange(len(pred_labels)), pred_labels]
+        probs = _ensure_probabilities(preds)
+        pred_labels = np.argmax(probs, axis=1)
+        pred_confidence = probs[np.arange(len(pred_labels)), pred_labels]
     if y.ndim > 1:
         true_labels = np.argmax(y, axis=1)
     else:
@@ -1758,6 +2532,11 @@ def localise_by_bexec_qres_guider(
 
     idx_pass = np.where(success_scores > 0)[0]
     idx_fail = np.where(failure_scores > 0)[0]
+    sample_size = min(len(idx_pass), len(idx_fail))
+    if sample_size > 0:
+        rng = np.random.default_rng(sample_seed)
+        idx_pass = rng.choice(idx_pass, sample_size, replace=False)
+        idx_fail = rng.choice(idx_fail, sample_size, replace=False)
 
     if "hydra" not in str(path_to_keras_model):
         model = load_model(path_to_keras_model, compile=False)
@@ -1767,8 +2546,14 @@ def localise_by_bexec_qres_guider(
     costs_and_keys = []
     for idx_to_tl, vs in target_weights.items():
         t_w, lname = vs
-        fail_cov = _coverage_per_unit(model, idx_to_tl, X[idx_fail], failure_scores[idx_fail] if len(idx_fail) else None, activation_threshold)
-        pass_cov = _coverage_per_unit(model, idx_to_tl, X[idx_pass], success_scores[idx_pass] if len(idx_pass) else None, activation_threshold)
+        fail_cov = _coverage_per_unit(
+            model, idx_to_tl, X[idx_fail],
+            failure_scores[idx_fail] if len(idx_fail) else None,
+            activation_threshold, normalise_sample_weights)
+        pass_cov = _coverage_per_unit(
+            model, idx_to_tl, X[idx_pass],
+            success_scores[idx_pass] if len(idx_pass) else None,
+            activation_threshold, normalise_sample_weights)
         if fail_cov is None and pass_cov is None:
             continue
         if fail_cov is None:
@@ -1778,3 +2563,21 @@ def localise_by_bexec_qres_guider(
         costs_and_keys.extend(_build_results_from_cov(idx_to_tl, lname, t_w, fail_cov, pass_cov, eps))
 
     return sorted(costs_and_keys, key=lambda v: v[1], reverse=True)
+
+
+# Guider：保留旧入口，转调到 bexec_qres_sbfl
+def localise_by_bexec_qres_guider(
+    X, y, predictions, target_weights,
+    path_to_keras_model=None, is_multi_label=True, eps=1e-12, activation_threshold=0.1,
+    sample_seed=None, normalise_sample_weights=True):
+    """
+    Backward-compatible wrapper for bexec_qres_sbfl.
+    """
+    return localise_by_bexec_qres_sbfl(
+        X, y, predictions, target_weights,
+        path_to_keras_model=path_to_keras_model,
+        is_multi_label=is_multi_label,
+        eps=eps,
+        activation_threshold=activation_threshold,
+        sample_seed=sample_seed,
+        normalise_sample_weights=normalise_sample_weights)
