@@ -4,6 +4,7 @@ RQ1 script
 import os, sys
 import pandas as pd
 import utils.data_util as data_util
+import utils.model_util as model_util
 import auto_patch_vk as auto_patch
 from utils.eval_util import read_and_add_flag, combine_init_aft_predcs
 import numpy as np
@@ -11,6 +12,8 @@ import numpy as np
 LAYER = -1 # all layers
 # Use the in-repo faulty models layout (data is symlinked to final_data)
 Faulty_mdl_path = "data/models/rq1_faulty_mdl"
+Faulty_mdl_path_cifar_cl = "data/models/rq1_faulty_mdl_cifar_cl"
+Faulty_mdl_path_gtsrb_cl = "data/models/rq1_faulty_mdl_gtsrb_cl"
 
 def return_target_fault_id(afile, seed):
 	if afile is None:
@@ -78,7 +81,7 @@ if __name__ == "__main__":
 	parser.add_argument('-which_data', action = "store", default = 'cifar10', type = str, 
 		help = 'fashion_mnist,cifaf10,lfw')
 	parser.add_argument("-loc_method", action = "store", default = None, 
-	help = 'random, localiser, gradient_loss, c_localiser, sbfl')
+	help = 'random, localiser, gradient_loss, c_localiser, qexec_qres_sbfl, qexec_bres_sbfl, bexec_qres_guider, bexec_bres_sbfl')
 	parser.add_argument("-seed", action = "store", default = 1, type = int)
 	parser.add_argument("-dest", default = ".", type = str)
 	parser.add_argument("-target_all", type = int, default = 1)
@@ -87,6 +90,8 @@ if __name__ == "__main__":
 		help = 'if given, localise based on the behaviour difference on the test data')
 	parser.add_argument("-fid_file", type = str, 
 		help = "a file that contains the ids (used seeds) of target faulty model", default = None)
+	parser.add_argument("--save-conf-fi", action="store_true",
+		help="save confidence distribution and FI details alongside localisation outputs")
 
 	args = parser.parse_args()	
 
@@ -94,6 +99,22 @@ if __name__ == "__main__":
 	if path_to_faulty_model is None:
 		print ('Seed {} not our target for layer {}'.format(args.seed, LAYER))
 		sys.exit()
+
+	# For CIFAR10 channels_first models, convert to channels_last for CPU execution
+	if args.which_data == 'cifar10':
+		cl_path = path_to_faulty_model.replace(Faulty_mdl_path, Faulty_mdl_path_cifar_cl)
+		if not os.path.exists(cl_path):
+			os.makedirs(os.path.dirname(cl_path), exist_ok=True)
+			model_util.convert_cifar_to_channels_last(path_to_faulty_model, cl_path)
+		path_to_faulty_model = cl_path
+	# For GTSRB channels_first models, convert to channels_last for CPU execution
+	if args.which_data == 'GTSRB':
+		cl_path = path_to_faulty_model.replace(Faulty_mdl_path, Faulty_mdl_path_gtsrb_cl)
+		if not os.path.exists(cl_path):
+			os.makedirs(os.path.dirname(cl_path), exist_ok=True)
+			model_util.convert_gtsrb_to_channels_last(path_to_faulty_model, cl_path)
+		path_to_faulty_model = cl_path
+
 	os.makedirs(args.dest, exist_ok = True)
 
 	# is_input_2d = True => to match the format with faulty model
@@ -103,13 +124,15 @@ if __name__ == "__main__":
 	test_X, test_y = test_data
 	# set X and y for the localisation 
 	X,y = train_data if not args.on_test else test_data
+	if args.which_data == 'fashion_mnist':
+		# Faulty FM models expect flattened input shape (None,1,784)
+		X = X.reshape(len(X), 1, -1)
 
 	init_pred_df = read_and_add_flag(args.init_pred_file)
 	init_acc = np.sum(init_pred_df.true == init_pred_df.pred)/len(init_pred_df)
 
 	if args.aft_pred_file is None:
-		from tensorflow.keras.models import load_model
-		faulty_mdl = load_model(path_to_faulty_model, compile = False)
+		faulty_mdl = model_util.load_model_compat(path_to_faulty_model, compile = False)
 		predcs = faulty_mdl.predict(X) if args.which_data != 'fashion_mnist' else faulty_mdl.predict(X).reshape(len(X),-1)
 		pred_labels = np.argmax(predcs, axis = 1)
 		corr_predictions = pred_labels == y	
@@ -149,7 +172,8 @@ if __name__ == "__main__":
 		seed = args.seed,
 		target_all = bool(args.target_all),
 		only_loc = True,
-		loc_dest = args.dest)
+		loc_dest = args.dest,
+		save_conf_fi = args.save_conf_fi)
 
 	# for evaluation 
 	gt_df = pd.read_pickle(gt_file)
@@ -177,3 +201,4 @@ if __name__ == "__main__":
 	#print ("\tAt", localised_at)
 	#print ('\t', [idx/len(entire_k_and_cost) 
 	#	if entire_k_and_cost is not None else idx/len(indices_to_places_to_fix) for idx in localised_at])
+
